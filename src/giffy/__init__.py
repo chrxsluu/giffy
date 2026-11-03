@@ -23,7 +23,7 @@ from typing import Iterable, Sequence, Union
 from PIL import Image
 
 from . import _giffy, even as _even
-from .align import CENTER, Alignment, crop_boxes, find, refine
+from .align import CENTER, Alignment, crop_boxes, find, refine, small
 
 __all__ = ["Alignment", "CENTER", "Shot", "encode", "encode_shot", "make_gif", "wiggle_order"]
 
@@ -146,17 +146,26 @@ def encode_shot(images: Sequence[Source], width: int | None = None, delay_ms: in
             if len({f.size for f in frames}) > 1:
                 raise ValueError(f"photos differ in size: {sorted({f.size for f in frames})}")
             fw, fh = frames[0].size
+            smalls = list(ex.map(small, frames))   # one cheap copy each, for finding and for lighting
             if align is not None:
                 if isinstance(align, Alignment):
                     if not _fits(align, len(frames), fw / fh):
                         raise ValueError("alignment was made for a different shot")
                     alignment = align
                 else:
-                    alignment = find(frames, align)
+                    alignment = find(frames, align, smalls)
                 boxes = crop_boxes((fw, fh), refine(frames, alignment))
                 frames = list(ex.map(lambda fb: fb[0].crop(fb[1]), zip(frames, boxes)))
+                sw, sh = smalls[0].size
+                sboxes = crop_boxes((sw, sh), [(round(dx * sw), round(dy * sh)) for dx, dy in alignment.shifts])
+                smalls = [s.crop(b) for s, b in zip(smalls, sboxes)]
             if even:
-                gains = alignment.gains if alignment is not None and alignment.gains else _even.gains(frames)
+                if alignment is not None and alignment.gains:
+                    gains = alignment.gains
+                elif alignment is not None and alignment.status == "none":
+                    gains = ((1.0, 1.0, 1.0),) * len(frames)   # unaligned frames may not show the same view
+                else:
+                    gains = _even.gains(smalls)
                 frames = list(ex.map(lambda fg: _even.apply(*fg), zip(frames, gains)))
                 if alignment is not None:
                     alignment = replace(alignment, gains=gains)

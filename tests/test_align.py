@@ -72,6 +72,9 @@ def test_match_validates():
         _giffy.match(b, b, 320, 240, 10, 10, 1, 0, 0, 4, 4)
     with pytest.raises(ValueError):
         _giffy.match(b, b, 320, 240, 10, 10, 32, 0, 0, -1, 4)
+    big = bytes(4100 * 4100)
+    with pytest.raises(ValueError):   # rows past 4096 px could overflow the 32-bit row sums
+        _giffy.match(big, big, 4100, 4100, 0, 0, 4097, 0, 0, 1, 1)
     _, _, best, second = _giffy.match(b, b, 320, 240, 10, 10, 32, 1000, 0, 4, 4)
     assert best == -1.0 and second == -1.0
 
@@ -86,22 +89,25 @@ def textured_rgb(w, h, seed=1) -> Image.Image:
     return Image.merge("RGB", [textured(w, h, seed + k) for k in range(3)])
 
 
-def parallax(n, fg_shift, bg_shift, size=(640, 480), seed=3, disc=True):
+def parallax(n, fg_shift, bg_shift, size=(640, 480), seed=3, disc=True, shake=None):
     """n frames of a textured background moving bg_shift px per lens, with a
-    textured disc in the middle moving fg_shift px per lens (ref = (n - 1) // 2)."""
+    textured disc in the middle moving fg_shift px per lens (ref = (n - 1) // 2).
+    shake: optional per-frame vertical offset of the whole frame, px."""
     w, h = size
     ref, m = (n - 1) // 2, abs(bg_shift) * n + 8
-    bg = textured_rgb(w + 2 * m, h, seed)
+    v = max([abs(s) for s in shake or [0]]) + 1
+    bg = textured_rgb(w + 2 * m, h + 2 * v, seed)
     fg = textured_rgb(w, h, seed + 10)
     r = round(0.15 * w)
     frames = []
     for i in range(n):
-        f = bg.crop((m - bg_shift * (i - ref), 0, m - bg_shift * (i - ref) + w, h))
+        sy = v - (shake[i] if shake else 0)
+        f = bg.crop((m - bg_shift * (i - ref), sy, m - bg_shift * (i - ref) + w, sy + h))
         if disc:
-            cx, cy = w // 2 + fg_shift * (i - ref), h // 2
+            cx, cy = w // 2 + fg_shift * (i - ref), h // 2 + (shake[i] if shake else 0)
             mask = Image.new("L", (w, h))
             ImageDraw.Draw(mask).ellipse([cx - r, cy - r, cx + r, cy + r], fill=255)
-            f.paste(shifted(fg, fg_shift * (i - ref), 0), (0, 0), mask)
+            f.paste(shifted(fg, fg_shift * (i - ref), shake[i] if shake else 0), (0, 0), mask)
         frames.append(f)
     return frames
 
@@ -179,6 +185,27 @@ def test_one_weak_lens_is_filled_in():
     assert find(frames).status == "none"
 
 
+def test_hand_shake_up_and_down():
+    shake = [20, 0, -18, 10]   # px at 480 high: beyond a 3% search, inside 6%
+    frames = parallax(4, 20, 4, shake=shake)
+    al = find(frames)
+    assert al.status == "aligned"
+    assert near(refine(frames, al), [(dx, sy) for (dx, _), sy in zip(FG, shake)])
+
+
+def test_shake_beyond_the_search_is_unaligned():
+    frames = parallax(4, 20, 4, shake=[68, 0, -68, 34])   # 3 px (analysis) past the 6% search
+    assert find(frames).status == "none"
+
+
+def test_a_different_view_is_not_matched():
+    frames = parallax(4, 20, 4)
+    frames[3] = textured_rgb(640, 480, 77)   # another scene altogether
+    al = find(frames)
+    assert al.status == "aligned"            # filled in from its neighbours, not matched
+    assert abs(round(al.shifts[3][0] * 640) - 40) <= 1
+
+
 def test_point_near_the_edge():
     al = find(parallax(4, 20, 4), (0.99, 0.01))
     assert al.status in ("aligned", "moved", "none")
@@ -212,7 +239,7 @@ def test_alignment_records_what_happened():
     al = find(parallax(4, 20, 4))
     assert isinstance(al, align.Alignment)
     assert al.aspect == pytest.approx(640 / 480)
-    assert 0.6 <= al.confidence <= 1.0 and al.gains == ()
+    assert align.NCC_MIN <= al.confidence <= 1.0 and al.gains == ()
     assert al.crop != (0.0, 0.0, 1.0, 1.0)
 
 
@@ -380,3 +407,11 @@ def test_cli_align_flags(tmp_path):
     assert (tmp_path / "t.gif").read_bytes() == encode(paths, align=(0.1, 0.1))
     giffy.main([str(tmp_path / "f.gif"), *map(str, paths), "--align-at", "0.5625", "0.5", "3"])
     assert (tmp_path / "f.gif").read_bytes() == encode(paths, align=(0.5625, 0.5, 3))
+
+
+def test_unaligned_shot_is_not_evened():
+    frames = [textured_rgb(640, 480, s) for s in (1, 20, 40, 60)]   # four unrelated views
+    frames[1] = scaled(frames[1], (0.7, 0.7, 0.7))
+    shot = encode_shot(frames)
+    assert shot.alignment.status == "none"
+    assert shot.alignment.gains == ((1.0, 1.0, 1.0),) * 4

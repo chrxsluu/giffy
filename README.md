@@ -68,6 +68,8 @@ It builds one C file on install, so the machine needs a C compiler and Python he
 
 giffy is faster and sharper on every row and smaller on all but one. The exception is the synthetic scene at 1080, which is 14% bigger: its heavy artificial noise suits Pillow's coarser palette. Pass `lossy=6` or more for smaller files.
 
+Alignment and evening add 1–10 ms per shot on the M2 Pro at any size, measured as the extra time of a whole encode.
+
 On a slower 4-core Linux box (Intel N150, gcc), the synthetic shot runs 718 → 370 ms full, 175 → 124 ms at 1080, and 47 → 39 ms at 320.
 
 > [!NOTE]

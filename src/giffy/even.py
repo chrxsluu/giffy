@@ -16,7 +16,7 @@ from PIL import Image
 
 GAIN_MIN, GAIN_MAX = 0.85, 1.18   # cap per channel
 MID_LO, MID_HI = 16, 240          # only unclipped mid-tones are measured
-EVEN_W = 80                       # gains are measured on copies this wide
+EVEN_W = 40                       # gains are measured on copies this wide
 
 
 def gains(frames: list[Image.Image]) -> tuple[tuple[float, float, float], ...]:

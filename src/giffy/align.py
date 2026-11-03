@@ -17,8 +17,8 @@ from . import _giffy
 ANALYSIS_W = 320      # decisions are made on a luma copy this wide (or the frame's width, if smaller)
 PATCH = 0.10          # patch side, fraction of analysis width (32 px)
 SEARCH_X = 0.12       # sideways search, fraction of width, each way, per lens step from the reference
-SEARCH_Y = 0.03       # up-down search, fraction of height, each way
-NCC_MIN = 0.60        # a match is good if its score is at least this...
+SEARCH_Y = 0.06       # up-down search, fraction of height, each way (mounting slop, hand shake)
+NCC_MIN = 0.85        # a match is good if its score is at least this (true matches score ~0.98)...
 UNIQUE_MIN = 0.08     # ...and beats the best score elsewhere (> PATCH/4 away) by at least this
 DETAIL_MIN = 5.0      # luma standard deviation a patch needs to count as detailed
 REPEAT_MAX = 0.90     # a patch whose self-match has a second peak this high is a repeating pattern
@@ -49,15 +49,20 @@ class _Luma:
         self.buf = im.tobytes()
 
 
-def _analysis(frames: list[Image.Image]) -> list[_Luma]:
-    w, h = frames[0].size
+def small(frame: Image.Image) -> Image.Image:
+    """The frame as an ANALYSIS_W-wide RGB copy (or the frame, if it's no wider)."""
+    w, h = frame.size
     aw = min(ANALYSIS_W, w)
     ah = max(1, round(h * aw / w))
-    out = []
-    for f in frames:
-        g = f.convert("L")
-        out.append(_Luma(g if (aw, ah) == (w, h) else g.resize((aw, ah), Image.Resampling.BOX)))
-    return out
+    if (aw, ah) == (w, h):
+        return frame
+    k = min(w // aw, h // ah)   # a fast whole-number shrink first, then the exact size
+    f = frame.reduce(k) if k > 1 else frame
+    return f.resize((aw, ah), Image.Resampling.BOX)
+
+
+def _analysis(frames: list[Image.Image], smalls=None) -> list[_Luma]:
+    return [_Luma(s.convert("L")) for s in (smalls or [small(f) for f in frames])]
 
 
 def _patch(lum: _Luma, cx: float, cy: float, p: int) -> tuple[int, int]:
@@ -101,11 +106,12 @@ def _none(n: int, ref: int, aspect: float, point=CENTER) -> Alignment:
                      "none", 0.0)
 
 
-def find(frames: list[Image.Image], at: tuple = CENTER) -> Alignment:
+def find(frames: list[Image.Image], at: tuple = CENTER, smalls: list[Image.Image] | None = None) -> Alignment:
     """Where each frame has to move so the point at `at` holds still.
 
     frames: upright RGB images, all the same size. at: (x, y) as fractions of
     the reference frame, or (x, y, frame) for a point seen in another frame.
+    smalls: small(f) for each frame, if the caller already made them.
     """
     n = len(frames)
     ref = (n - 1) // 2
@@ -113,7 +119,7 @@ def find(frames: list[Image.Image], at: tuple = CENTER) -> Alignment:
     aspect = w / h
     if n < 2:
         return _none(n, ref, aspect)
-    lum = _analysis(frames)
+    lum = _analysis(frames, smalls)
     aw, ah = lum[0].w, lum[0].h
     p = round(PATCH * ANALYSIS_W)
     if aw < 2 * p or ah < 2 * p:   # too small for one patch with room around it
@@ -165,14 +171,15 @@ def find(frames: list[Image.Image], at: tuple = CENTER) -> Alignment:
 
 
 def refine(frames: list[Image.Image], al: Alignment) -> list[tuple[int, int]]:
-    """al's shifts as whole pixels at these frames' size, re-matched locally."""
+    """al's shifts as whole pixels at these frames' size, re-matched locally.
+    Only the region around the patch is looked at, so this costs little at full size."""
     n = len(frames)
     if al.status == "none":
         return [(0, 0)] * n
     w, h = frames[0].size
-    lum = [_Luma(f.convert("L")) for f in frames]
     p = min(REFINE_CAP, max(2, round(PATCH * w)), w, h)
-    x, y = _patch(lum[al.ref], al.point[0] * w, al.point[1] * h, p)
+    x = min(max(round(al.point[0] * w - p / 2), 0), w - p)
+    y = min(max(round(al.point[1] * h - p / 2), 0), h - p)
     r = math.ceil(max(w / ANALYSIS_W, 1.0)) + 1
     out = []
     for i in range(n):
@@ -180,7 +187,11 @@ def refine(frames: list[Image.Image], al: Alignment) -> list[tuple[int, int]]:
         if i == al.ref:
             out.append((0, 0))
             continue
-        m = _giffy.match(lum[al.ref].buf, lum[i].buf, w, h, x, y, p, dx0, dy0, r, r)
+        # one region holding the patch and every window position, in both frames
+        l, t = max(0, min(x, x + dx0 - r)), max(0, min(y, y + dy0 - r))
+        rr, b = min(w, max(x + p, x + dx0 + r + p)), min(h, max(y + p, y + dy0 + r + p))
+        a, c = frames[al.ref].crop((l, t, rr, b)).convert("L"), frames[i].crop((l, t, rr, b)).convert("L")
+        m = _giffy.match(a.tobytes(), c.tobytes(), rr - l, b - t, x - l, y - t, p, dx0, dy0, r, r)
         out.append((m[0], m[1]) if m[2] > -1 else (dx0, dy0))
     return out
 

@@ -595,6 +595,7 @@ done:
 /* ---------------------------------------------------------------- matching */
 
 #define NO_SCORE (-2.0)   /* offset where the patch would leave the frame */
+#define MATCH_MAX 4096    /* largest patch side: a row's sums of p*q stay within 32 bits */
 
 /* Zero-mean normalised cross-correlation of the size x size patch at (x, y) in
  * ref against each offset of the search window in other. Scores ignore
@@ -617,10 +618,12 @@ static void match_grid(const uint8_t *ref, const uint8_t *oth, int w, int h, int
             int64_t sq = 0, sqq = 0, spq = 0;
             for (int j = 0; j < size; j++) {
                 const uint8_t *pr = ref + (size_t)(y + j) * w + x, *qr = oth + (size_t)(oy + j) * w + ox;
+                uint32_t rq = 0, rqq = 0, rpq = 0;   /* exact for rows up to MATCH_MAX px; vectorises */
                 for (int i = 0; i < size; i++) {
-                    const int64_t p = pr[i], q = qr[i];
-                    sq += q; sqq += q * q; spq += p * q;
+                    const uint32_t p = pr[i], q = qr[i];
+                    rq += q; rqq += q * q; rpq += p * q;
                 }
+                sq += rq; sqq += rqq; spq += rpq;
             }
             const double qvar = (double)sqq - (double)sq * sq / n, cov = (double)spq - (double)sp * sq / n;
             *g = (pvar <= 0 || qvar <= 0) ? 0.0 : cov / sqrt(pvar * qvar);
@@ -637,7 +640,7 @@ static PyObject *py_match(PyObject *self, PyObject *args) {
     if ((uint64_t)rb.len != (uint64_t)w * (uint64_t)h || (uint64_t)ob.len != (uint64_t)w * (uint64_t)h) {
         PyErr_SetString(PyExc_ValueError, "luma buffers must be w*h bytes"); goto done;
     }
-    if (size < 2 || x < 0 || y < 0 || x + size > w || y + size > h) {
+    if (size < 2 || size > MATCH_MAX || x < 0 || y < 0 || x + size > w || y + size > h) {
         PyErr_SetString(PyExc_ValueError, "the patch must lie inside the frame"); goto done;
     }
     if (rx < 0 || ry < 0 || rx > MAX_SIDE || ry > MAX_SIDE || dx0 < -MAX_SIDE || dx0 > MAX_SIDE ||

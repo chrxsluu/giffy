@@ -105,14 +105,17 @@ def run(name, paths):
         refs = full if not width else [f.resize((width, round(f.height * width / f.width)), Image.Resampling.LANCZOS) for f in full]
         label = "full" if not width else str(width)
         rows = {}
+        # quality is measured unaligned (same frames as Pillow); "aligned" adds line-up, crop and evening
         for enc, fn in [("tuned Pillow", lambda o: tuned_pillow(paths, o, width)),
-                        ("giffy", lambda o: giffy.make_gif(paths, o, width))]:
-            out = OUT / f"{name}-{label}-{enc.split()[0].lower()}.gif"
+                        ("giffy", lambda o: giffy.make_gif(paths, o, width, align=None, even=False)),
+                        ("giffy aligned", lambda o: giffy.make_gif(paths, o, width))]:
+            out = OUT / f"{name}-{label}-{enc.replace(' ', '-').lower()}.gif"
             t = timed(lambda: fn(out))
             rows[enc] = t
-            q, qb = quality(out, refs)
+            q, qb = quality(out, refs) if enc != "giffy aligned" else (float("nan"),) * 2
             print(f"{label:>6} {enc:13} {t * 1000:6.0f} {out.stat().st_size / 1e6:6.2f} {q:6.2f} {qb:6.2f}")
-        print(f"{'':>6} {'speed-up':13} {rows['tuned Pillow'] / rows['giffy']:5.1f}x")
+        print(f"{'':>6} {'speed-up':13} {rows['tuned Pillow'] / rows['giffy']:5.1f}x unaligned, "
+              f"{rows['tuned Pillow'] / rows['giffy aligned']:.1f}x aligned")
 
 
 if __name__ == "__main__":
