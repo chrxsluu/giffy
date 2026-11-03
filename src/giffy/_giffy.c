@@ -5,6 +5,7 @@
  */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -12,11 +13,11 @@
 
 #define MAX_SIDE 65535                 /* GIF stores sizes as 16-bit */
 #define LUT_SIZE (1 << 18)             /* nearest-colour table: 6 bits per channel */
-#define KMEANS_ITERS 3
+#define KMEANS_ITERS 1
 
 /* ------------------------------------------------------------------ palette */
 
-typedef struct { int n; int32_t r[256], g[256], b[256]; } Pal;
+typedef struct { int n; int32_t r[256], g[256], b[256]; float fr[256], fg[256], fb[256]; } Pal;
 
 static int load_pal(const Py_buffer *pb, Pal *p) {
     if (pb->len < 3 || pb->len > 768 || pb->len % 3) {
@@ -27,20 +28,33 @@ static int load_pal(const Py_buffer *pb, Pal *p) {
     p->n = (int)(pb->len / 3);
     for (int i = 0; i < p->n; i++) {
         p->r[i] = s[3 * i]; p->g[i] = s[3 * i + 1]; p->b[i] = s[3 * i + 2];
+        p->fr[i] = (float)p->r[i]; p->fg[i] = (float)p->g[i]; p->fb[i] = (float)p->b[i];
     }
     return 0;
 }
 
+/* Smallest of d[0..n), as 8 independent lanes so it vectorises (also on plain SSE2). */
+static inline float min_of(const float *d, int n) {
+    float m[8] = {FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX};
+    int i = 0;
+    for (; i + 8 <= n; i += 8)
+        for (int j = 0; j < 8; j++) m[j] = d[i + j] < m[j] ? d[i + j] : m[j];
+    for (; i < n; i++) m[0] = d[i] < m[0] ? d[i] : m[0];
+    for (int j = 1; j < 8; j++) m[0] = m[j] < m[0] ? m[j] : m[0];
+    return m[0];
+}
+
 /* Index of the closest palette colour (squared RGB distance; ties -> lowest index).
- * Three simple passes so the compiler can vectorise them. */
+ * Floats hold these integer distances (< 2^24) exactly and multiply fast everywhere. */
 static int nearest(const Pal *p, int r, int g, int b) {
-    int32_t d[256], m = INT32_MAX;
+    float d[256];
+    const float fr = (float)r, fg = (float)g, fb = (float)b;
     const int n = p->n;
     for (int i = 0; i < n; i++) {
-        int32_t dr = p->r[i] - r, dg = p->g[i] - g, db = p->b[i] - b;
+        float dr = p->fr[i] - fr, dg = p->fg[i] - fg, db = p->fb[i] - fb;
         d[i] = dr * dr + dg * dg + db * db;
     }
-    for (int i = 0; i < n; i++) m = d[i] < m ? d[i] : m;
+    const float m = min_of(d, n);
     int i = 0;
     while (d[i] != m) i++;
     return i;
@@ -229,45 +243,47 @@ static void build_palette(const uint8_t **px, int nf, size_t npix, int w, int k,
         if (!wu_cut(m, &boxes[pick], &boxes[nb])) { boxes[pick].sse = 0; continue; }
         nb++;
     }
-    /* 4. Box means, then k-means over the occupied bins to tighten them.
-     * Colours are kept x16 as integers so the nearest-centroid search vectorises. */
-    int32_t cr[256], cg[256], cb[256];
+    /* 4. Box means, then k-means over the occupied bins to tighten them. */
+    float cr[256], cg[256], cb[256];
     for (int i = 0; i < nb; i++) {
         Mom v = vol(m, &boxes[i]);
-        cr[i] = (int32_t)((v.r * 16 + v.n / 2) / v.n);
-        cg[i] = (int32_t)((v.g * 16 + v.n / 2) / v.n);
-        cb[i] = (int32_t)((v.b * 16 + v.n / 2) / v.n);
+        cr[i] = (float)((double)v.r / v.n); cg[i] = (float)((double)v.g / v.n); cb[i] = (float)((double)v.b / v.n);
     }
     int nbins = 0;
     for (int i = 0; i < 32 * 32 * 32; i++) if (hist[i].n) hist[nbins++] = hist[i];   /* compact in place */
+    float *mean = malloc(sizeof(float) * 3 * (size_t)nbins);
+    if (!mean) { free(hist); free(m); free(boxes); o->err = 1; return; }
+    for (int i = 0; i < nbins; i++) {
+        mean[3 * i] = (float)((double)hist[i].r / hist[i].n);
+        mean[3 * i + 1] = (float)((double)hist[i].g / hist[i].n);
+        mean[3 * i + 2] = (float)((double)hist[i].b / hist[i].n);
+    }
     for (int it = 0; it < KMEANS_ITERS; it++) {
         int64_t sr[256] = {0}, sg[256] = {0}, sb[256] = {0}, sn[256] = {0};
         for (int i = 0; i < nbins; i++) {
             const Mom *hb = &hist[i];
-            const int32_t r = (int32_t)((hb->r * 16 + hb->n / 2) / hb->n), g = (int32_t)((hb->g * 16 + hb->n / 2) / hb->n),
-                          b = (int32_t)((hb->b * 16 + hb->n / 2) / hb->n);
-            int32_t d[256], bd = INT32_MAX;   /* three simple passes so they vectorise */
+            const float r = mean[3 * i], g = mean[3 * i + 1], b = mean[3 * i + 2];
+            float d[256];
             for (int c = 0; c < nb; c++) {
-                int32_t dr = cr[c] - r, dg = cg[c] - g, db = cb[c] - b;
+                float dr = cr[c] - r, dg = cg[c] - g, db = cb[c] - b;
                 d[c] = dr * dr + dg * dg + db * db;
             }
-            for (int c = 0; c < nb; c++) bd = d[c] < bd ? d[c] : bd;
+            const float bd = min_of(d, nb);
             int best = 0;
             while (d[best] != bd) best++;
             sr[best] += hb->r; sg[best] += hb->g; sb[best] += hb->b; sn[best] += hb->n;
         }
         for (int c = 0; c < nb; c++) if (sn[c] > 0) {
-            cr[c] = (int32_t)((sr[c] * 16 + sn[c] / 2) / sn[c]);
-            cg[c] = (int32_t)((sg[c] * 16 + sn[c] / 2) / sn[c]);
-            cb[c] = (int32_t)((sb[c] * 16 + sn[c] / 2) / sn[c]);
+            cr[c] = (float)((double)sr[c] / sn[c]); cg[c] = (float)((double)sg[c] / sn[c]);
+            cb[c] = (float)((double)sb[c] / sn[c]);
         }
     }
-    for (int i = 0; i < nb; i++) {   /* x16 -> 0..255, rounded */
-        o->rgb[3 * i] = (uint8_t)((cr[i] + 8) >> 4); o->rgb[3 * i + 1] = (uint8_t)((cg[i] + 8) >> 4);
-        o->rgb[3 * i + 2] = (uint8_t)((cb[i] + 8) >> 4);
+    for (int i = 0; i < nb; i++) {   /* centroids stay within 0..255: they are means of pixels */
+        o->rgb[3 * i] = (uint8_t)(cr[i] + 0.5f); o->rgb[3 * i + 1] = (uint8_t)(cg[i] + 0.5f);
+        o->rgb[3 * i + 2] = (uint8_t)(cb[i] + 0.5f);
     }
     o->n = nb;
-    free(hist); free(m); free(boxes);
+    free(mean); free(hist); free(m); free(boxes);
 }
 
 static int check_size(Py_ssize_t w, Py_ssize_t h) {

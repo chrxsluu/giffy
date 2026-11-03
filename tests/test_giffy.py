@@ -8,6 +8,7 @@ import pytest
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageStat
 
 import giffy
+import refdec
 from giffy import _giffy, encode, make_gif, wiggle_order
 
 FFMPEG = shutil.which("ffmpeg")
@@ -17,7 +18,8 @@ def raw_gif(idx: bytes, w: int, h: int, pal: bytes, min_size: int, frames: int =
     """Smallest valid GIF around one LZW stream from _giffy.lzw."""
     bits = max(1, (len(pal) // 3 - 1).bit_length())
     data = _giffy.lzw(idx, min_size)
-    frame = b"\x2c" + struct.pack("<HHHHB", 0, 0, w, h, 0) + data
+    frame = (b"\x21\xf9\x04\x04\x0a\x00\x00\x00"  # 100 ms, so decoders keep every frame
+             + b"\x2c" + struct.pack("<HHHHB", 0, 0, w, h, 0) + data)
     return (b"GIF89a" + struct.pack("<HHBBB", w, h, 0xF0 | (bits - 1), 0, 0)
             + pal + bytes(3 * (1 << bits) - len(pal)) + frame * frames + b"\x3b")
 
@@ -37,7 +39,9 @@ def decode_rgb(path, n=None):
 
 
 def ffmpeg_rgb(path, w, h):
-    raw = subprocess.run([FFMPEG, "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+    # passthrough: one output frame per GIF frame (no frame-rate duplication)
+    raw = subprocess.run([FFMPEG, "-v", "error", "-i", str(path), "-fps_mode", "passthrough",
+                          "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
                          check=True, capture_output=True).stdout
     return [raw[i:i + w * h * 3] for i in range(0, len(raw), w * h * 3)]
 
@@ -74,6 +78,7 @@ def test_lzw_round_trips(tmp_path, w, h, min_size, kind):
     p = tmp_path / "t.gif"
     p.write_bytes(raw_gif(idx, w, h, pal, min_size, frames=2))
     want = expected_rgb(idx, pal)
+    assert refdec.decode(p.read_bytes()) == [idx, idx]
     assert decode_rgb(p) == [want, want]
     if FFMPEG:
         assert ffmpeg_rgb(p, w, h)[:2] == [want, want]
@@ -135,6 +140,7 @@ def frame_indexes(data: bytes, w: int, h: int, pal: bytes, tmp_path):
     p.write_bytes(g)
     with Image.open(p) as im:
         idx = im.tobytes()
+    assert refdec.decode(g) == [idx]
     if FFMPEG:
         assert ffmpeg_rgb(p, w, h)[0] == expected_rgb(idx, pal)
     return idx
@@ -368,3 +374,45 @@ def test_cli(tmp_path, capsys):
     assert capsys.readouterr().out.strip().endswith("c.gif")
     with Image.open(tmp_path / "c.gif") as g:
         assert g.n_frames == 3 and g.size == (32, 24)
+
+
+@pytest.mark.parametrize("colors", [2, 3, 16, 129])
+def test_small_palettes_through_the_dither_path(tmp_path, colors):
+    src = scene(200, 150, n=2)
+    p = tmp_path / "s.gif"
+    p.write_bytes(encode(src, colors=colors))
+    frames = decode_rgb(p)
+    for f in frames:
+        assert len(set(f[i:i + 3] for i in range(0, len(f), 3))) <= colors
+    if FFMPEG:
+        assert ffmpeg_rgb(p, 200, 150) == frames
+
+
+def test_no_dither(tmp_path):
+    src = scene(200, 150, n=2)
+    plain = decode_rgb_bytes(encode(src, dither=False, lossy=0), tmp_path)
+    assert psnr(plain[0], src[0].tobytes()) > 25
+
+
+def test_random_shots_decode_the_same_in_pillow_and_ffmpeg(tmp_path):
+    rnd = random.Random(11)
+    for trial in range(25):
+        w, h, n = rnd.randrange(1, 300), rnd.randrange(1, 200), rnd.randrange(1, 5)
+        kind = rnd.choice(["scene", "noise", "flat"])
+        if kind == "scene" and w >= 16 and h >= 16:
+            ims = scene(w, h, n=n, seed=trial)
+        elif kind == "noise":
+            ims = [Image.frombytes("RGB", (w, h), rnd.randbytes(w * h * 3)) for _ in range(n)]
+        else:
+            ims = [Image.new("RGB", (w, h), tuple(rnd.randrange(256) for _ in range(3))) for _ in range(n)]
+        kw = dict(colors=rnd.choice([2, 7, 64, 256]), lossy=rnd.choice([0, 1.5, 4, 30]),
+                  dither=rnd.random() < 0.8, order=rnd.choice([None, list(range(n))]))
+        p = tmp_path / f"r{trial}.gif"
+        p.write_bytes(encode(ims, **kw))
+        frames = decode_rgb(p)
+        assert len(frames) == len(kw["order"] or wiggle_order(n)), (trial, kw)
+        if FFMPEG:
+            assert ffmpeg_rgb(p, w, h) == frames, (trial, w, h, kw)
+        gif = p.read_bytes()
+        pal = gif[13:13 + 3 * (2 << (gif[10] & 7))]
+        assert [expected_rgb(i, pal) for i in refdec.decode(gif)] == frames
