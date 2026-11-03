@@ -5,7 +5,6 @@
  */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
-#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -88,6 +87,11 @@ static int cset_find(const ColorSet *s, uint32_t c) {
     return -1;
 }
 
+static uint64_t gcd(uint64_t a, uint64_t b) {
+    while (b) { uint64_t t = a % b; a = b; b = t; }
+    return a;
+}
+
 static int cmp_u32(const void *a, const void *b) {
     uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
     return (x > y) - (x < y);
@@ -146,7 +150,7 @@ static int wu_cut(const Mom *m, Box *x, Box *y) {
 
 typedef struct { int n; uint8_t rgb[768]; int exact; int err; } PalOut;
 
-static void build_palette(const uint8_t **px, int nf, size_t npix, int w, int h, int k, PalOut *o) {
+static void build_palette(const uint8_t **px, int nf, size_t npix, int w, int k, PalOut *o) {
     o->err = 0;
     /* 1. Few enough colours? Then the palette is exactly those, sorted (lossless). */
     ColorSet *cs = calloc(1, sizeof *cs);
@@ -182,17 +186,18 @@ static void build_palette(const uint8_t **px, int nf, size_t npix, int w, int h,
     Mom *hist = calloc(32 * 32 * 32, sizeof *hist), *m = calloc(33 * 33 * 33, sizeof *m);
     Box *boxes = malloc(sizeof(Box) * k);
     if (!hist || !m || !boxes) { free(hist); free(m); free(boxes); o->err = 1; return; }
+    /* every stride-th pixel of the frames laid end to end; a stride sharing no
+     * factor with the width walks through every column instead of a few */
     const uint64_t total = (uint64_t)npix * (uint64_t)nf;
-    int step = 1;
-    while ((uint64_t)(step + 1) * (uint64_t)(step + 1) * (1u << 20) <= total) step++;
-    for (int f = 0; f < nf; f++) {
-        for (int y = 0; y < h; y += step) {
-            const uint8_t *row = px[f] + (size_t)y * w * 3;
-            for (int x = (y / step * 7 + f * 3) % step; x < w; x += step) {   /* stagger columns: no aliasing */
-                int r = row[3 * x], g = row[3 * x + 1], b = row[3 * x + 2];
-                Mom *c = &hist[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)];
-                c->n++; c->r += r; c->g += g; c->b += b; c->q += r * r + g * g + b * b;
-            }
+    uint64_t stride = total >> 20, j = 0;
+    if (stride < 1) stride = 1;
+    while (gcd(stride, (uint64_t)w) != 1) stride++;
+    for (int f = 0; f < nf; f++, j -= npix) {
+        for (; j < npix; j += stride) {
+            const uint8_t *q = px[f] + 3 * j;
+            int r = q[0], g = q[1], b = q[2];
+            Mom *c = &hist[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)];
+            c->n++; c->r += r; c->g += g; c->b += b; c->q += r * r + g * g + b * b;
         }
     }
     /* cumulative moments (Wu 1991) */
@@ -224,32 +229,42 @@ static void build_palette(const uint8_t **px, int nf, size_t npix, int w, int h,
         if (!wu_cut(m, &boxes[pick], &boxes[nb])) { boxes[pick].sse = 0; continue; }
         nb++;
     }
-    /* 4. Box means, then k-means over the occupied bins to tighten them. */
-    float cr[256], cg[256], cb[256];
+    /* 4. Box means, then k-means over the occupied bins to tighten them.
+     * Colours are kept x16 as integers so the nearest-centroid search vectorises. */
+    int32_t cr[256], cg[256], cb[256];
     for (int i = 0; i < nb; i++) {
         Mom v = vol(m, &boxes[i]);
-        cr[i] = (float)v.r / v.n; cg[i] = (float)v.g / v.n; cb[i] = (float)v.b / v.n;
+        cr[i] = (int32_t)((v.r * 16 + v.n / 2) / v.n);
+        cg[i] = (int32_t)((v.g * 16 + v.n / 2) / v.n);
+        cb[i] = (int32_t)((v.b * 16 + v.n / 2) / v.n);
     }
     int nbins = 0;
     for (int i = 0; i < 32 * 32 * 32; i++) if (hist[i].n) hist[nbins++] = hist[i];   /* compact in place */
     for (int it = 0; it < KMEANS_ITERS; it++) {
-        double sr[256] = {0}, sg[256] = {0}, sb[256] = {0}, sn[256] = {0};
+        int64_t sr[256] = {0}, sg[256] = {0}, sb[256] = {0}, sn[256] = {0};
         for (int i = 0; i < nbins; i++) {
-            float r = (float)hist[i].r / hist[i].n, g = (float)hist[i].g / hist[i].n, b = (float)hist[i].b / hist[i].n;
-            int best = 0;
-            float bd = FLT_MAX;
-            for (int j = 0; j < nb; j++) {
-                float dr = cr[j] - r, dg = cg[j] - g, db = cb[j] - b, d = dr * dr + dg * dg + db * db;
-                if (d < bd) { bd = d; best = j; }
+            const Mom *hb = &hist[i];
+            const int32_t r = (int32_t)((hb->r * 16 + hb->n / 2) / hb->n), g = (int32_t)((hb->g * 16 + hb->n / 2) / hb->n),
+                          b = (int32_t)((hb->b * 16 + hb->n / 2) / hb->n);
+            int32_t d[256], bd = INT32_MAX;   /* three simple passes so they vectorise */
+            for (int c = 0; c < nb; c++) {
+                int32_t dr = cr[c] - r, dg = cg[c] - g, db = cb[c] - b;
+                d[c] = dr * dr + dg * dg + db * db;
             }
-            sr[best] += hist[i].r; sg[best] += hist[i].g; sb[best] += hist[i].b; sn[best] += hist[i].n;
+            for (int c = 0; c < nb; c++) bd = d[c] < bd ? d[c] : bd;
+            int best = 0;
+            while (d[best] != bd) best++;
+            sr[best] += hb->r; sg[best] += hb->g; sb[best] += hb->b; sn[best] += hb->n;
         }
-        for (int j = 0; j < nb; j++) if (sn[j] > 0) {
-            cr[j] = (float)(sr[j] / sn[j]); cg[j] = (float)(sg[j] / sn[j]); cb[j] = (float)(sb[j] / sn[j]);
+        for (int c = 0; c < nb; c++) if (sn[c] > 0) {
+            cr[c] = (int32_t)((sr[c] * 16 + sn[c] / 2) / sn[c]);
+            cg[c] = (int32_t)((sg[c] * 16 + sn[c] / 2) / sn[c]);
+            cb[c] = (int32_t)((sb[c] * 16 + sn[c] / 2) / sn[c]);
         }
     }
-    for (int i = 0; i < nb; i++) {
-        o->rgb[3 * i] = (uint8_t)(cr[i] + 0.5f); o->rgb[3 * i + 1] = (uint8_t)(cg[i] + 0.5f); o->rgb[3 * i + 2] = (uint8_t)(cb[i] + 0.5f);
+    for (int i = 0; i < nb; i++) {   /* x16 -> 0..255, rounded */
+        o->rgb[3 * i] = (uint8_t)((cr[i] + 8) >> 4); o->rgb[3 * i + 1] = (uint8_t)((cg[i] + 8) >> 4);
+        o->rgb[3 * i + 2] = (uint8_t)((cb[i] + 8) >> 4);
     }
     o->n = nb;
     free(hist); free(m); free(boxes);
@@ -291,7 +306,7 @@ static PyObject *py_palette(PyObject *self, PyObject *args) {
     }
     PalOut o;
     Py_BEGIN_ALLOW_THREADS
-    build_palette(px, (int)nf, npix, (int)w, (int)h, k, &o);
+    build_palette(px, (int)nf, npix, (int)w, k, &o);
     Py_END_ALLOW_THREADS
     if (o.err) { PyErr_NoMemory(); goto done; }
     res = Py_BuildValue("(y#O)", (const char *)o.rgb, (Py_ssize_t)o.n * 3, o.exact ? Py_True : Py_False);
@@ -481,11 +496,13 @@ static int encode_dither(const uint8_t *rgb, int w, int h, const Pal *p, uint16_
     int32_t *e0 = calloc((size_t)(w + 2) * 3, sizeof *e0), *e1 = calloc((size_t)(w + 2) * 3, sizeof *e1);
     LzwMem *m = malloc(sizeof *m);
     if (!e0 || !e1 || !m) { free(e0); free(e1); free(m); return -1; }
+    /* Floyd-Steinberg weights 7, 3, 5, 1 (/16), times strength/16: errors are x256 */
+    const int32_t w7 = 7 * strength, w3 = 3 * strength, w5 = 5 * strength, w1 = strength;
     Lzw z;
     lzw_start(&z, min, out, m, lossy > 0);
     for (int y = 0; y < h; y++) {
         const uint8_t *s = rgb + (size_t)y * w * 3;
-        const int32_t *in = e0 + 3;   /* error for this row, x16, column x at in[3x] */
+        const int32_t *in = e0 + 3;   /* error for this row, x256, column x at in[3x] */
         int32_t *nx = e1 + 3;         /* error for the next row; column -1 is padding */
         /* in registers: 7/16 from the left neighbour (f*), and the next row's
          * running sums for columns x-1 (a*) and x (b*) */
@@ -493,9 +510,9 @@ static int encode_dither(const uint8_t *rgb, int w, int h, const Pal *p, uint16_
         for (int x = 0; x < w; x++, s += 3, in += 3) {
             int v[3];
             int t;
-            t = s[0] + ((in[0] + fr + 8) >> 4); v[0] = t < 0 ? 0 : t > 255 ? 255 : t;
-            t = s[1] + ((in[1] + fg + 8) >> 4); v[1] = t < 0 ? 0 : t > 255 ? 255 : t;
-            t = s[2] + ((in[2] + fb + 8) >> 4); v[2] = t < 0 ? 0 : t > 255 ? 255 : t;
+            t = s[0] + ((in[0] + fr + 128) >> 8); v[0] = t < 0 ? 0 : t > 255 ? 255 : t;
+            t = s[1] + ((in[1] + fg + 128) >> 8); v[1] = t < 0 ? 0 : t > 255 ? 255 : t;
+            t = s[2] + ((in[2] + fb + 128) >> 8); v[2] = t < 0 ? 0 : t > 255 ? 255 : t;
             int k = lut_get(lut, p, v[0], v[1], v[2]);
             if (x == 0 && y == 0) {
                 z.w = (uint32_t)k;
@@ -514,13 +531,12 @@ static int encode_dither(const uint8_t *rgb, int w, int h, const Pal *p, uint16_
                 if (code >= 0) z.w = (uint32_t)code;
                 else lzw_add(&z, (uint32_t)k, slot);
             }
-            const int32_t er = (v[0] - p->r[k]) * strength / 16, eg = (v[1] - p->g[k]) * strength / 16,
-                          eb = (v[2] - p->b[k]) * strength / 16;
-            fr = 7 * er; fg = 7 * eg; fb = 7 * eb;                      /* right */
+            const int32_t er = v[0] - p->r[k], eg = v[1] - p->g[k], eb = v[2] - p->b[k];
+            fr = w7 * er; fg = w7 * eg; fb = w7 * eb;                   /* right */
             int32_t *o = nx + 3 * (x - 1);                              /* down-left is now complete */
-            o[0] = ar + 3 * er; o[1] = ag + 3 * eg; o[2] = ab + 3 * eb;
-            ar = br + 5 * er; ag = bg + 5 * eg; ab = bb + 5 * eb;       /* down */
-            br = er; bg = eg; bb = eb;                                  /* down-right */
+            o[0] = ar + w3 * er; o[1] = ag + w3 * eg; o[2] = ab + w3 * eb;
+            ar = br + w5 * er; ag = bg + w5 * eg; ab = bb + w5 * eb;    /* down */
+            br = w1 * er; bg = w1 * eg; bb = w1 * eb;                   /* down-right */
         }
         int32_t *o = nx + 3 * (w - 1);
         o[0] = ar; o[1] = ag; o[2] = ab;
