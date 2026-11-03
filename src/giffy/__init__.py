@@ -6,21 +6,26 @@
 Pillow decodes (and optionally resizes) the photos; the C core builds one shared
 palette, then dithers and LZW-encodes each unique frame once, one frame per core.
 Light lossy LZW (on by default) spends a little of the extra quality on size.
+By default the frames are first lined up on the centre (align.py), cropped to
+the area they share, and evened out in brightness and colour (even.py).
 """
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import struct
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Sequence, Union
 
 from PIL import Image
 
-from . import _giffy
+from . import _giffy, even as _even
+from .align import CENTER, Alignment, crop_boxes, find, refine
 
-__all__ = ["encode", "make_gif", "wiggle_order"]
+__all__ = ["Alignment", "CENTER", "Shot", "encode", "encode_shot", "make_gif", "wiggle_order"]
 
 Source = Union[str, os.PathLike, Image.Image]
 T = Image.Transpose
@@ -30,6 +35,13 @@ _UPRIGHT = {2: T.FLIP_LEFT_RIGHT, 3: T.ROTATE_180, 4: T.FLIP_TOP_BOTTOM, 5: T.TR
 _SIDEWAYS = {5, 6, 7, 8}
 LOSSY = 4      # max extra RGB distance a pixel may take to lengthen an LZW match
 STRENGTH = 14  # Floyd-Steinberg error kept, in 16ths: a touch under full cleans flat areas
+CROP_ROOM = 0.85  # aligned shots decode at width / this, so a crop up to 15% needs no upscaling
+
+
+@dataclass(frozen=True)
+class Shot:
+    gif: bytes
+    alignment: Alignment | None   # None when alignment was off
 
 
 def wiggle_order(n: int) -> list[int]:
@@ -61,16 +73,50 @@ def _load(src: Source, width: int | None) -> tuple[tuple[int, int], bytes]:
             f.close()
 
 
+def _upright(src: Source, width: int | None) -> Image.Image:
+    """Upright RGB copy of one photo, not resized: JPEGs decode at reduced size
+    when that still leaves room to crop and come out `width` px wide."""
+    own = not isinstance(src, Image.Image)
+    f = im = Image.open(src) if own else src
+    try:
+        orient = im.getexif().get(0x0112, 1)
+        w, h = im.size[::-1] if orient in _SIDEWAYS else im.size
+        if own and width and width < w:
+            tw = min(w, math.ceil(width / CROP_ROOM))
+            size = (tw, max(1, round(h * tw / w)))
+            im.draft("RGB", size[::-1] if orient in _SIDEWAYS else size)
+        im = im.convert("RGB") if im.mode != "RGB" else im.copy()
+        return im.transpose(_UPRIGHT[orient]) if orient in _UPRIGHT else im
+    finally:
+        if own:
+            f.close()
+
+
+def _fits(al: Alignment, n: int, aspect: float) -> bool:
+    return len(al.shifts) == n and al.ref == (n - 1) // 2 and abs(al.aspect / aspect - 1) <= 0.01
+
+
 def encode(images: Sequence[Source], width: int | None = None, delay_ms: int = 100,
            order: Iterable[int] | None = None, colors: int = 256, dither: bool = True,
-           lossy: float = LOSSY, threads: int | None = None) -> bytes:
-    """GIF bytes for `images` (paths or PIL images), looping forever.
+           lossy: float = LOSSY, threads: int | None = None, align=CENTER, even: bool = True) -> bytes:
+    """GIF bytes for `images`: encode_shot(...).gif."""
+    return encode_shot(images, width, delay_ms, order, colors, dither, lossy, threads, align, even).gif
 
-    width: None keeps the photos' own size; else resize to this many px wide.
+
+def encode_shot(images: Sequence[Source], width: int | None = None, delay_ms: int = 100,
+                order: Iterable[int] | None = None, colors: int = 256, dither: bool = True,
+                lossy: float = LOSSY, threads: int | None = None, align=CENTER, even: bool = True) -> Shot:
+    """The GIF for `images` (paths or PIL images), looping forever, and how it was aligned.
+
+    width: None keeps the photos' size; else the finished GIF is this many px wide.
     order: playback order as frame indexes; None = wiggle_order (1-2-3-4-3-2).
     lossy: 0 = best quality; higher = smaller files (shots with <= `colors`
-    colours are always stored exactly). Alpha is dropped. All photos must come
-    out the same size.
+    colours are always stored exactly).
+    align: the point to hold still, (x, y) as fractions of the middle frame or
+    (x, y, frame) for a point seen in another frame; an Alignment from an
+    earlier call (e.g. the preview) to reuse; or None to leave frames as shot.
+    even: even out brightness and colour between the lenses.
+    Alpha is dropped. All photos must come out the same size.
     """
     if not images:
         raise ValueError("no images")
@@ -84,8 +130,41 @@ def encode(images: Sequence[Source], width: int | None = None, delay_ms: int = 1
         raise ValueError(f"order {order} must pick from frames 0..{len(images) - 1}")
     used = sorted(set(order))
     threads = threads or min(4, os.cpu_count() or 1)
+    if isinstance(align, tuple):
+        if len(align) not in (2, 3):
+            raise ValueError(f"align {align} must be (x, y) or (x, y, frame)")
+        if len(align) == 3:
+            if align[2] not in used:
+                raise ValueError(f"align frame {align[2]} isn't played in order {order}")
+            align = (align[0], align[1], used.index(align[2]))
+    alignment = None
     with ThreadPoolExecutor(threads) as ex:
-        loaded = dict(zip(used, ex.map(lambda i: _load(images[i], width), used)))
+        if align is None and not even:
+            loaded = dict(zip(used, ex.map(lambda i: _load(images[i], width), used)))
+        else:
+            frames = list(ex.map(lambda i: _upright(images[i], width), used))
+            if len({f.size for f in frames}) > 1:
+                raise ValueError(f"photos differ in size: {sorted({f.size for f in frames})}")
+            fw, fh = frames[0].size
+            if align is not None:
+                if isinstance(align, Alignment):
+                    if not _fits(align, len(frames), fw / fh):
+                        raise ValueError("alignment was made for a different shot")
+                    alignment = align
+                else:
+                    alignment = find(frames, align)
+                boxes = crop_boxes((fw, fh), refine(frames, alignment))
+                frames = list(ex.map(lambda fb: fb[0].crop(fb[1]), zip(frames, boxes)))
+            if even:
+                gains = alignment.gains if alignment is not None and alignment.gains else _even.gains(frames)
+                frames = list(ex.map(lambda fg: _even.apply(*fg), zip(frames, gains)))
+                if alignment is not None:
+                    alignment = replace(alignment, gains=gains)
+            cw, ch = frames[0].size
+            if width and width != cw:
+                size = (width, max(1, round(ch * width / cw)))
+                frames = list(ex.map(lambda f: f.resize(size, Image.Resampling.LANCZOS), frames))
+            loaded = {i: (f.size, f.tobytes()) for i, f in zip(used, frames)}
         sizes = {size for size, _ in loaded.values()}
         if len(sizes) > 1:
             raise ValueError(f"photos differ in size: {sorted(sizes)}")
@@ -111,7 +190,7 @@ def encode(images: Sequence[Source], width: int | None = None, delay_ms: int = 1
     for i in order:
         parts += [gce, desc, data[i]]
     parts.append(b"\x3b")
-    return b"".join(parts)
+    return Shot(b"".join(parts), alignment)
 
 
 def make_gif(images: Sequence[Source], out: str | os.PathLike, width: int | None = None,
@@ -132,8 +211,19 @@ def main(argv=None) -> None:
     ap.add_argument("--forward", action="store_true", help="play 1-2-3-4 instead of 1-2-3-4-3-2")
     ap.add_argument("--lossy", type=float, default=LOSSY, help=f"0 = best quality, higher = smaller (default {LOSSY})")
     ap.add_argument("--no-dither", action="store_true")
+    ap.add_argument("--no-align", action="store_true", help="leave the frames as shot")
+    ap.add_argument("--align-at", nargs="+", metavar="X Y [FRAME]",
+                    help="point to hold still, as fractions (default: the centre); FRAME = the frame it's seen in")
+    ap.add_argument("--no-even", action="store_true", help="don't even out brightness and colour")
     ap.add_argument("--threads", type=int)
     a = ap.parse_args(argv)
     order = range(len(a.images)) if a.forward else None
+    align = CENTER
+    if a.no_align:
+        align = None
+    elif a.align_at:
+        if len(a.align_at) not in (2, 3):
+            ap.error("--align-at takes X Y or X Y FRAME")
+        align = (float(a.align_at[0]), float(a.align_at[1])) + ((int(a.align_at[2]),) if len(a.align_at) == 3 else ())
     print(make_gif(a.images, a.out, a.width, a.delay, order=order, colors=a.colors,
-                   dither=not a.no_dither, lossy=a.lossy, threads=a.threads))
+                   dither=not a.no_dither, lossy=a.lossy, threads=a.threads, align=align, even=not a.no_even))

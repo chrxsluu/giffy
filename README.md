@@ -12,13 +12,27 @@ from giffy import make_gif
 make_gif(["lens1.jpg", "lens2.jpg", "lens3.jpg", "lens4.jpg"], "shot.gif")              # full size
 make_gif(paths, "share.gif", width=1080)                                              # resized
 make_gif(paths, "best.gif", lossy=0)                                                   # max quality
+make_gif(paths, "cup.gif", align=(0.3, 0.6))                                          # hold this spot still
 ```
 
 ```bash
 giffy shot.gif lens1.jpg lens2.jpg lens3.jpg lens4.jpg [--width 1080] [--lossy 4] [--forward]
+                                                       [--align-at X Y [FRAME]] [--no-align] [--no-even]
 ```
 
-`make_gif(images, out, width=None, delay_ms=100, order=None, colors=256, dither=True, lossy=4, threads=None)` takes paths or PIL images and plays them 1-2-3-4-3-2, looping forever. `encode(...)` returns the GIF as bytes. It applies EXIF orientation, drops alpha, and raises `ValueError` if the photos come out different sizes. Shots with 256 colours or fewer are stored exactly (lossless).
+`make_gif(images, out, width=None, delay_ms=100, order=None, colors=256, dither=True, lossy=4, threads=None, align=(0.5, 0.5), even=True)` takes paths or PIL images and plays them 1-2-3-4-3-2, looping forever. `encode(...)` returns the GIF as bytes.
+
+By default the frames are lined up so the centre holds still, cropped to the area all frames share (keeping the photos' 4:3 shape), and evened out in brightness and colour so the wiggle doesn't flicker. `width` is the finished GIF's width, after the crop. `align=(x, y)` holds a different spot still, as fractions of the middle frame. `align=(x, y, frame)` takes a spot as seen in another frame, which is what a tap on a playing GIF gives you. `align=None, even=False` gives exactly the output from before alignment existed.
+
+For shimmy, `encode_shot(...)` returns a `Shot` with the GIF bytes and the `Alignment` it used: the shifts, crop, lighting gains, whether it held the requested spot (`"aligned"`), moved to nearby detail (`"moved"`) or left the frames as shot (`"none"`), and a match confidence. Make the 320 px preview first, then pass its alignment to the full GIF so both hold exactly the same point:
+
+```python
+from giffy import encode_shot
+
+preview = encode_shot(paths, width=320)                         # on screen first
+full = encode_shot(paths, width=1080, align=preview.alignment)   # same still point and lighting
+again = encode_shot(paths, width=320, align=(0.3, 0.6, 2))       # re-align on a tap seen in frame 3
+``` It applies EXIF orientation, drops alpha, and raises `ValueError` if the photos come out different sizes. Shots with 256 colours or fewer are stored exactly (lossless).
 
 It is a drop-in for shimmy's `shimmy_spike.wiggle.make_gif(paths, out, width, delay_ms)`. shimmy's 640 px floor stays in shimmy.
 
@@ -63,12 +77,13 @@ Rerun with `uv run python bench/bench.py [PHOTO_DIR ...]` (one directory per sho
 
 ## How it works
 
-Pillow still decodes the JPEGs with libjpeg-turbo, in parallel, and handles resizing (JPEG draft decode, then Lanczos). Everything after that is one C file, `src/giffy/_giffy.c`, which releases the GIL so frames run on separate cores.
+Pillow still decodes the JPEGs with libjpeg-turbo, in parallel, and handles resizing (JPEG draft decode, then Lanczos). Alignment and evening are Python on small copies (`align.py`, `even.py`), with the patch matching in C. Everything after that is one C file, `src/giffy/_giffy.c`, which releases the GIL so frames run on separate cores.
 
-1. **One palette for the whole shot.** Exact colours if there are 256 or fewer. Otherwise Wu's variance split on a 5-bit histogram of about 1M sampled pixels, then one k-means pass. It's a far better fit than Pillow's FASTOCTREE, and is where most of the quality gain comes from.
-2. **Dither and compress in one pass.** Floyd–Steinberg at 14/16 strength (full strength mostly adds noise to flat areas) feeds the LZW encoder pixel by pixel. A shared nearest-colour table (6 bits per channel) fills in as it goes.
-3. **Lossy LZW, with the error diffused.** When a pixel's nearest colour would end the current LZW string, it may take a colour that continues the string instead, if that colour is at most `lossy` RGB units further from its target. The extra error goes to its neighbours like any dither error, so areas keep their true colour. This is what makes the files smaller than Pillow's despite the finer palette.
-4. **Each unique frame is encoded once.** The 1-2-3-4-3-2 loop writes frames 2 and 3 twice from the same bytes, under one global colour table. Pillow re-encodes all six frames on one core.
+1. **Line up, crop, even out.** On a 320 px grey copy, giffy finds where the detail around the still point sits in each frame. It uses zero-mean normalised cross-correlation in the C core, so a brighter lens can't fool it. A plain or repeating spot moves to the nearest unique detail, within 15% of the width. A shot is aligned in every frame or none: one weak lens is filled in from its evenly spaced neighbours, and otherwise the frames stay as shot. The shifts are then refined at full resolution, the frames are cropped to their shared 4:3 area, and each lens gets per-channel gains, measured on mid-tones and capped, that multiply to 1 so the shot keeps its overall look.
+2. **One palette for the whole shot.** Exact colours if there are 256 or fewer. Otherwise Wu's variance split on a 5-bit histogram of about 1M sampled pixels, then one k-means pass. It's a far better fit than Pillow's FASTOCTREE, and is where most of the quality gain comes from.
+3. **Dither and compress in one pass.** Floyd–Steinberg at 14/16 strength (full strength mostly adds noise to flat areas) feeds the LZW encoder pixel by pixel. A shared nearest-colour table (6 bits per channel) fills in as it goes.
+4. **Lossy LZW, with the error diffused.** When a pixel's nearest colour would end the current LZW string, it may take a colour that continues the string instead, if that colour is at most `lossy` RGB units further from its target. The extra error goes to its neighbours like any dither error, so areas keep their true colour. This is what makes the files smaller than Pillow's despite the finer palette.
+5. **Each unique frame is encoded once.** The 1-2-3-4-3-2 loop writes frames 2 and 3 twice from the same bytes, under one global colour table. Pillow re-encodes all six frames on one core.
 
 Output is deterministic: the same photos give the same bytes, whatever the thread count.
 
@@ -78,4 +93,4 @@ Output is deterministic: the same photos give the same bytes, whatever the threa
 uv run pytest
 ```
 
-There are 54 tests. Every stream is decoded by three independent decoders that must agree: Pillow, ffmpeg (when installed) and a plain-Python reference (`tests/refdec.py`). They cover sizes from 1×1 up to 25 MP (enough table resets to wrap the hash generation counter), every min code size, lossless small palettes, lossy colour fidelity, EXIF orientation, resizing, thread-count determinism, bad arguments and randomised shots. The suite also passes under AddressSanitizer and UBSan (clang on macOS, gcc on Linux) and on Python 3.11 with Pillow 9.4 (Raspberry Pi OS Bookworm's versions).
+There are 87 tests. Every stream is decoded by three independent decoders that must agree: Pillow, ffmpeg (when installed) and a plain-Python reference (`tests/refdec.py`). They cover sizes from 1×1 up to 25 MP (enough table resets to wrap the hash generation counter), every min code size, lossless small palettes, lossy colour fidelity, EXIF orientation, resizing, thread-count determinism, bad arguments and randomised shots. For alignment, they use generated shots with known shifts (foreground vs background, taps on other frames, plain spots, flat and dark shots, repeating patterns, a weak lens), check that known lens colour differences are removed without touching the overall look, and check that alignment off gives byte-for-byte the output from before. The suite also passes under AddressSanitizer and UBSan (clang on macOS, gcc on Linux) and on Python 3.11 with Pillow 9.4 (Raspberry Pi OS Bookworm's versions).

@@ -269,3 +269,114 @@ def test_even_skips_clipped_pixels():
     assert spread(frames, mid) > 0.03
     g = even.gains(frames)
     assert spread([even.apply(f, gi) for f, gi in zip(frames, g)], mid) < 0.01
+
+
+# ---------------------------------------------------------------- pipeline
+
+import giffy  # noqa: E402
+import refdec  # noqa: E402
+from giffy import Shot, encode, encode_shot, make_gif  # noqa: E402
+from test_giffy import FFMPEG, decode_rgb, expected_rgb, ffmpeg_rgb  # noqa: E402
+
+
+def gif_frames(data: bytes, tmp_path):
+    p = tmp_path / "a.gif"
+    p.write_bytes(data)
+    out = []
+    with Image.open(p) as im:
+        for i in range(im.n_frames):
+            im.seek(i)
+            out.append(im.convert("RGB"))
+    return out
+
+
+def held_still(frames) -> bool:
+    """The centre of every frame matches frame 0's centre at offset (0, 0) +- 1 px."""
+    ref = frames[0].convert("L")
+    w, h = ref.size
+    p = max(8, w // 10)
+    x, y = (w - p) // 2, (h - p) // 2
+    for f in frames[1:]:
+        dx, dy, best, _ = _giffy.match(ref.tobytes(), f.convert("L").tobytes(), w, h, x, y, p, 0, 0, 8, 4)
+        if abs(dx) > 1 or abs(dy) > 1 or best < 0.8:
+            return False
+    return True
+
+
+def test_aligned_gif_holds_the_point(tmp_path):
+    frames = gif_frames(encode(parallax(4, 20, 4)), tmp_path)
+    assert held_still(frames)
+    w, h = frames[0].size
+    assert abs(w * 3 - h * 4) <= 4 and w < 640
+    assert not held_still(gif_frames(encode(parallax(4, 20, 4), align=None, even=False), tmp_path))
+
+
+def test_width_is_the_final_width(tmp_path):
+    w, h = gif_frames(encode(parallax(4, 20, 4), width=320), tmp_path)[0].size
+    assert w == 320 and abs(h - 240) <= 1
+
+
+def test_preview_and_full_hold_the_same_point(tmp_path):
+    frames = parallax(4, 20, 4)
+    preview = encode_shot(frames, width=160)
+    full = encode_shot(frames, width=640, align=preview.alignment)
+    assert isinstance(preview, Shot) and preview.alignment.status == full.alignment.status == "aligned"
+    assert full.alignment.point == preview.alignment.point and full.alignment.gains == preview.alignment.gains
+    assert held_still(gif_frames(preview.gif, tmp_path)) and held_still(gif_frames(full.gif, tmp_path))
+
+
+def test_reused_alignment_must_fit():
+    al = encode_shot(parallax(4, 20, 4)).alignment
+    with pytest.raises(ValueError, match="different shot"):
+        encode_shot(parallax(3, 20, 4), align=al)
+    with pytest.raises(ValueError, match="different shot"):
+        encode_shot(parallax(4, 20, 4, size=(640, 360)), align=al)
+
+
+def test_far_subject_no_crop(tmp_path):
+    shot = encode_shot(parallax(4, 0, 0))
+    assert gif_frames(shot.gif, tmp_path)[0].size == (640, 480)
+
+
+def test_single_and_tiny(tmp_path):
+    one = encode_shot([textured_rgb(200, 150)])
+    assert one.alignment.status == "none" and gif_frames(one.gif, tmp_path)[0].size == (200, 150)
+    tiny = encode_shot([textured_rgb(40, 30, s) for s in range(4)])
+    assert tiny.alignment.status == "none" and gif_frames(tiny.gif, tmp_path)[0].size == (40, 30)
+
+
+def test_threads_never_change_the_bytes_aligned():
+    frames = parallax(4, 20, 4)
+    one = encode(frames, threads=1)
+    assert encode(frames, threads=3) == one and encode(frames, threads=4) == one
+
+
+def test_make_gif_drop_in(tmp_path):
+    paths = []
+    for i, f in enumerate(parallax(4, 20, 4, size=(800, 600))):
+        paths.append(tmp_path / f"cam{i + 1}.jpg")
+        f.save(paths[-1], quality=92)
+    out = make_gif(paths, tmp_path / "w.gif", 640, 100)
+    assert out == tmp_path / "w.gif"
+    frames = decode_rgb(out)
+    assert len(frames) == 6
+    gif = out.read_bytes()
+    pal = gif[13:13 + 3 * (2 << (gif[10] & 7))]
+    assert [expected_rgb(i, pal) for i in refdec.decode(gif)] == frames
+    with Image.open(out) as g:
+        assert g.size[0] == 640
+        if FFMPEG:
+            assert ffmpeg_rgb(out) == frames
+
+
+def test_cli_align_flags(tmp_path):
+    paths = []
+    for i, f in enumerate(parallax(4, 20, 4)):
+        paths.append(tmp_path / f"cam{i + 1}.png")
+        f.save(paths[-1])
+    giffy.main([str(tmp_path / "n.gif"), *map(str, paths), "--no-align"])
+    assert (tmp_path / "n.gif").read_bytes() == encode(paths, align=None)
+    giffy.main([str(tmp_path / "t.gif"), *map(str, paths), "--align-at", "0.1", "0.1"])
+    assert (tmp_path / "t.gif").read_bytes() == encode(paths, align=(0.1, 0.1))
+    giffy.main([str(tmp_path / "f.gif"), *map(str, paths), "--align-at", "0.5625", "0.5", "3"])
+    assert (tmp_path / "f.gif").read_bytes() == encode(paths, align=(0.5625, 0.5, 3))
