@@ -424,8 +424,6 @@ def test_random_shots_decode_the_same_in_pillow_and_ffmpeg(tmp_path):
         assert [expected_rgb(i, pal) for i in refdec.decode(gif)] == frames
 
 
-@pytest.mark.skipif(sys.platform != "darwin" or PIL.__version__ != "13.0.0",
-                    reason="hashes were recorded on macOS with Pillow 13.0.0")
 def seeded_scene(w, h, n=4, shift=6):
     """Like scene(), but every random value comes from one seeded generator
     (scene()'s effect_noise follows C rand(), so it changes with test order)."""
@@ -447,6 +445,8 @@ def seeded_scene(w, h, n=4, shift=6):
     return out
 
 
+@pytest.mark.skipif(sys.platform != "darwin" or PIL.__version__ != "13.0.0",
+                    reason="hashes were recorded on macOS with Pillow 13.0.0")
 def test_off_is_byte_identical_to_before():
     a = encode(seeded_scene(320, 240), **OFF)
     b = encode(seeded_scene(400, 300, n=3), width=200, lossy=0, **OFF)
