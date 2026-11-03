@@ -3,6 +3,10 @@
     from giffy import make_gif
     make_gif(["lens1.jpg", "lens2.jpg", "lens3.jpg", "lens4.jpg"], "shot.gif")
 
+Three modes: "normal" plays the photos once, in order, like any GIF; "loop"
+plays them 1-2-3-4-3-2 forever; "shimmy" (the default) is loop with the frames
+lined up on one point and evened out.
+
 Pillow decodes (and optionally resizes) the photos; the C core builds one shared
 palette, then dithers and LZW-encodes each unique frame once, one frame per core.
 Light lossy LZW (on by default) spends a little of the extra quality on size.
@@ -25,7 +29,7 @@ from PIL import Image
 from . import _giffy, even as _even
 from .align import CENTER, Alignment, crop_boxes, find, refine, small
 
-__all__ = ["Alignment", "CENTER", "Shot", "encode", "encode_shot", "make_gif", "wiggle_order"]
+__all__ = ["Alignment", "CENTER", "MODES", "Shot", "encode", "encode_shot", "make_gif", "wiggle_order"]
 
 Source = Union[str, os.PathLike, Image.Image]
 T = Image.Transpose
@@ -36,6 +40,8 @@ _SIDEWAYS = {5, 6, 7, 8}
 LOSSY = 4      # max extra RGB distance a pixel may take to lengthen an LZW match
 STRENGTH = 14  # Floyd-Steinberg error kept, in 16ths: a touch under full cleans flat areas
 CROP_ROOM = 0.85  # aligned shots decode at width / this, so a crop up to 15% needs no upscaling
+MODES = ("normal", "loop", "shimmy")
+BY_MODE = object()  # align default: the centre in shimmy mode, frames as shot otherwise
 
 
 @dataclass(frozen=True)
@@ -98,23 +104,29 @@ def _fits(al: Alignment, n: int, aspect: float) -> bool:
 
 def encode(images: Sequence[Source], width: int | None = None, delay_ms: int = 100,
            order: Iterable[int] | None = None, colors: int = 256, dither: bool = True,
-           lossy: float = LOSSY, threads: int | None = None, align=CENTER, even: bool | None = None) -> bytes:
+           lossy: float = LOSSY, threads: int | None = None, align=BY_MODE, even: bool | None = None,
+           mode: str = "shimmy") -> bytes:
     """GIF bytes for `images`: encode_shot(...).gif."""
-    return encode_shot(images, width, delay_ms, order, colors, dither, lossy, threads, align, even).gif
+    return encode_shot(images, width, delay_ms, order, colors, dither, lossy, threads, align, even, mode).gif
 
 
 def encode_shot(images: Sequence[Source], width: int | None = None, delay_ms: int = 100,
                 order: Iterable[int] | None = None, colors: int = 256, dither: bool = True,
-                lossy: float = LOSSY, threads: int | None = None, align=CENTER, even: bool | None = None) -> Shot:
-    """The GIF for `images` (paths or PIL images), looping forever, and how it was aligned.
+                lossy: float = LOSSY, threads: int | None = None, align=BY_MODE, even: bool | None = None,
+                mode: str = "shimmy") -> Shot:
+    """The GIF for `images` (paths or PIL images), and how it was aligned.
 
+    mode: "normal" plays once, in order; "loop" plays 1-2-3-4-3-2 forever;
+    "shimmy" is loop plus alignment on the centre. Options passed explicitly
+    (order, align, even) override what the mode would pick.
     width: None keeps the photos' size; else the finished GIF is this many px wide.
-    order: playback order as frame indexes; None = wiggle_order (1-2-3-4-3-2).
+    order: playback order as frame indexes; None = the mode's (1-2-3-4, or 1-2-3-4-3-2).
     lossy: 0 = best quality; higher = smaller files (shots with <= `colors`
     colours are always stored exactly).
     align: the point to hold still, (x, y) as fractions of the middle frame or
     (x, y, frame) for a point seen in another frame; an Alignment from an
     earlier call (e.g. the preview) to reuse; or None to leave frames as shot.
+    Default: the centre in shimmy mode, frames as shot otherwise.
     even: even out brightness and colour between the lenses. None (default) = when
     aligning; frames left as shot may not show the same view, so evening them is
     only done when asked for with even=True.
@@ -127,7 +139,13 @@ def encode_shot(images: Sequence[Source], width: int | None = None, delay_ms: in
     cs = round(delay_ms / 10)  # GIF delays are in 1/100 s
     if not 0 <= cs <= 0xFFFF:
         raise ValueError(f"delay {delay_ms} ms is outside 0..655350")
-    order = wiggle_order(len(images)) if order is None else list(order)
+    if mode not in MODES:
+        raise ValueError(f"mode {mode!r} must be one of {', '.join(MODES)}")
+    if order is None:
+        order = range(len(images)) if mode == "normal" else wiggle_order(len(images))
+    order = list(order)
+    if align is BY_MODE:
+        align = CENTER if mode == "shimmy" else None
     if not order or not all(0 <= i < len(images) for i in order):
         raise ValueError(f"order {order} must pick from frames 0..{len(images) - 1}")
     used = sorted(set(order))
@@ -198,8 +216,9 @@ def encode_shot(images: Sequence[Source], width: int | None = None, delay_ms: in
 
         data = dict(zip(used, ex.map(frame, used)))
     parts = [b"GIF89a", struct.pack("<HHBBB", w, h, 0xF0 | (bits - 1), 0, 0),
-             pal, bytes(3 * (1 << bits) - len(pal)),
-             b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00"]           # loop forever
+             pal, bytes(3 * (1 << bits) - len(pal))]
+    if mode != "normal":
+        parts.append(b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00")   # loop forever; without it, play once
     gce = b"\x21\xf9\x04\x04" + struct.pack("<H", cs) + b"\x00\x00"   # delay, keep previous frame
     desc = b"\x2c" + struct.pack("<HHHHB", 0, 0, w, h, 0)              # full frame, global palette
     for i in order:
@@ -217,9 +236,11 @@ def make_gif(images: Sequence[Source], out: str | os.PathLike, width: int | None
 
 
 def main(argv=None) -> None:
-    ap = argparse.ArgumentParser(prog="giffy", description="Make a wiggle GIF at full size and quality")
+    ap = argparse.ArgumentParser(prog="giffy", description="Make a GIF (or a wiggle GIF) at full size and quality")
     ap.add_argument("out", type=Path)
     ap.add_argument("images", type=Path, nargs="+")
+    ap.add_argument("--mode", choices=MODES, default="shimmy",
+                    help="normal: play once, in order; loop: 1-2-3-4-3-2 forever; shimmy: loop, lined up (default)")
     ap.add_argument("--width", type=int, help="resize to this width (default: keep the photos' size)")
     ap.add_argument("--delay", type=int, default=100, help="ms per frame (default 100)")
     ap.add_argument("--colors", type=int, default=256)
@@ -233,7 +254,7 @@ def main(argv=None) -> None:
     ap.add_argument("--threads", type=int)
     a = ap.parse_args(argv)
     order = range(len(a.images)) if a.forward else None
-    align = CENTER
+    align = BY_MODE
     if a.no_align:
         align = None
     elif a.align_at:
@@ -242,4 +263,4 @@ def main(argv=None) -> None:
         align = (float(a.align_at[0]), float(a.align_at[1])) + ((int(a.align_at[2]),) if len(a.align_at) == 3 else ())
     print(make_gif(a.images, a.out, a.width, a.delay, order=order, colors=a.colors,
                    dither=not a.no_dither, lossy=a.lossy, threads=a.threads, align=align,
-                   even=False if a.no_even else None))
+                   even=False if a.no_even else None, mode=a.mode))

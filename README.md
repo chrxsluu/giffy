@@ -13,16 +13,27 @@ make_gif(["lens1.jpg", "lens2.jpg", "lens3.jpg", "lens4.jpg"], "shot.gif")      
 make_gif(paths, "share.gif", width=1080)                                              # resized
 make_gif(paths, "best.gif", lossy=0)                                                   # max quality
 make_gif(paths, "cup.gif", align=(0.3, 0.6))                                          # hold this spot still
+make_gif(paths, "plain.gif", mode="normal")                                           # an ordinary GIF, plays once
 ```
 
 ```bash
-giffy shot.gif lens1.jpg lens2.jpg lens3.jpg lens4.jpg [--width 1080] [--lossy 4] [--forward]
-                                                       [--align-at X Y [FRAME]] [--no-align] [--no-even]
+giffy shot.gif lens1.jpg lens2.jpg lens3.jpg lens4.jpg [--mode normal|loop|shimmy] [--width 1080] [--lossy 4]
+                                                       [--forward] [--align-at X Y [FRAME]] [--no-align] [--no-even]
 ```
 
-`make_gif(images, out, width=None, delay_ms=100, order=None, colors=256, dither=True, lossy=4, threads=None, align=(0.5, 0.5), even=True)` takes paths or PIL images and plays them 1-2-3-4-3-2, looping forever. `encode(...)` returns the GIF as bytes.
+Three modes:
 
-By default the frames are lined up so the centre holds still, cropped to the area all frames share (keeping the photos' 4:3 shape), and evened out in brightness and colour so the wiggle doesn't flicker. `width` is the finished GIF's width, after the crop. `align=(x, y)` holds a different spot still, as fractions of the middle frame. `align=(x, y, frame)` takes a spot as seen in another frame, which is what a tap on a playing GIF gives you. `align=None` leaves the frames as shot and, unless you also pass `even=True`, gives exactly the output from before alignment existed.
+| Mode | Plays | Lined up and evened out |
+|---|---|---|
+| `normal` | once, in order (1-2-3-4) | no |
+| `loop` | 1-2-3-4-3-2, forever | no |
+| `shimmy` (default) | 1-2-3-4-3-2, forever | yes, on the centre |
+
+`loop` is exactly what giffy made before alignment existed. Options you pass explicitly win over the mode's choices: `order=` sets the playback, `align=` lines up any mode (`normal` included), and `align=None` turns it off.
+
+`make_gif(images, out, width=None, delay_ms=100, order=None, colors=256, dither=True, lossy=4, threads=None, align=<by mode>, even=None, mode="shimmy")` takes paths or PIL images. `encode(...)` returns the GIF as bytes.
+
+In shimmy mode the frames are lined up so the centre holds still, cropped to the area all frames share (keeping the photos' 4:3 shape), and evened out in brightness and colour so the wiggle doesn't flicker. `width` is the finished GIF's width, after the crop. `align=(x, y)` holds a different spot still, as fractions of the middle frame. `align=(x, y, frame)` takes a spot as seen in another frame, which is what a tap on a playing GIF gives you. `align=None` leaves the frames as shot; it doesn't even them out unless you also pass `even=True`.
 
 For shimmy, `encode_shot(...)` returns a `Shot` with the GIF bytes and the `Alignment` it used: the shifts, crop, lighting gains, whether it held the requested spot (`"aligned"`), moved to nearby detail (`"moved"`) or left the frames as shot (`"none"`), and a match confidence. Make the 320 px preview first, then pass its alignment to the full GIF so both hold exactly the same point:
 
@@ -95,4 +106,4 @@ Output is deterministic: the same photos give the same bytes, whatever the threa
 uv run pytest
 ```
 
-There are 96 tests. Every stream is decoded by three independent decoders that must agree: Pillow, ffmpeg (when installed) and a plain-Python reference (`tests/refdec.py`). They cover sizes from 1×1 up to 25 MP (enough table resets to wrap the hash generation counter), every min code size, lossless small palettes, lossy colour fidelity, EXIF orientation, resizing, thread-count determinism, bad arguments and randomised shots. For alignment, they use generated shots with known shifts (foreground vs background, taps on other frames, plain spots, flat and dark shots, repeating patterns, a weak lens), check that known lens colour differences are removed without touching the overall look, and check that alignment off gives byte-for-byte the output from before, that a tap at a frame edge never locks onto a wrong shift, and that a point moved to nearby detail holds still at full size. The suite also passes under AddressSanitizer and UBSan (clang on macOS, gcc on Linux) and on Python 3.11 with Pillow 9.4 (Raspberry Pi OS Bookworm's versions).
+There are 105 tests. Every stream is decoded by three independent decoders that must agree: Pillow, ffmpeg (when installed) and a plain-Python reference (`tests/refdec.py`). They cover sizes from 1×1 up to 25 MP (enough table resets to wrap the hash generation counter), every min code size, lossless small palettes, lossy colour fidelity, EXIF orientation, resizing, thread-count determinism, bad arguments and randomised shots. For alignment, they use generated shots with known shifts (foreground vs background, taps on other frames, plain spots, flat and dark shots, repeating patterns, a weak lens), check that known lens colour differences are removed without touching the overall look, and check that alignment off gives byte-for-byte the output from before, that a tap at a frame edge never locks onto a wrong shift, that a point moved to nearby detail holds still at full size, and that each mode plays as described (normal once and in order, loop byte-for-byte as before alignment). The suite also passes under AddressSanitizer and UBSan (clang on macOS, gcc on Linux) and on Python 3.11 with Pillow 9.4 (Raspberry Pi OS Bookworm's versions).
