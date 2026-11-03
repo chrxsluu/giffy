@@ -23,7 +23,7 @@ UNIQUE_MIN = 0.08     # ...and beats the best score elsewhere (> PATCH/4 away) b
 DETAIL_MIN = 5.0      # luma standard deviation a patch needs to count as detailed
 REPEAT_MAX = 0.90     # a patch whose self-match has a second peak this high is a repeating pattern
 NEAREST_MAX = 0.15    # nearest-detail search radius, fraction of width
-REFINE_CAP = 128      # largest patch side used by refine(), px
+REFINE_PATCH = 128    # refine() matches on copies reduced until its patch is at most this, px
 
 CENTER = (0.5, 0.5)
 
@@ -129,7 +129,7 @@ def find(frames: list[Image.Image], at: tuple = CENTER, smalls: list[Image.Image
         raise ValueError(f"frame {src} is not in this shot")
     ry = max(1, round(SEARCH_Y * ah))
     rx = lambda steps: max(1, round(SEARCH_X * aw * steps))  # noqa: E731
-    good = lambda m: m[2] >= NCC_MIN and m[2] - m[3] >= UNIQUE_MIN  # noqa: E731
+    good = lambda m: m[2] >= NCC_MIN and m[2] - m[3] >= UNIQUE_MIN and not m[4]  # noqa: E731
 
     hit = _detail_near(lum[src], at[0] * aw, at[1] * ah, p, rx(1), ry)
     if hit is None:
@@ -170,29 +170,56 @@ def find(frames: list[Image.Image], at: tuple = CENTER, smalls: list[Image.Image
                      (l / aw, t / ah, r / aw, b / ah), aspect, "moved" if moved else "aligned", min(scores))
 
 
+def _match_near(a: Image.Image, b: Image.Image, x: int, y: int, p: int, dx0: int, dy0: int, r: int, k: int):
+    """(dx, dy) in full pixels of the p x p patch at (x, y) of a, found in b within
+    dx0, dy0 +- r * k, matched on k-times reduced copies of just that region;
+    None unless the match is good."""
+    w, h = a.size
+    ml = min(x // k, math.ceil((x - (x + min(0, dx0) - (r + 1) * k)) / k))
+    mt = min(y // k, math.ceil((y - (y + min(0, dy0) - (r + 1) * k)) / k))
+    left, top = x - ml * k, y - mt * k   # patch lands on whole reduced pixels
+    right = min(w, x + max(0, dx0) + (r + 1) * k + p)
+    bottom = min(h, y + max(0, dy0) + (r + 1) * k + p)
+    right, bottom = left + (right - left) // k * k, top + (bottom - top) // k * k
+    pk = p // k
+    if pk < 2 or (right - left) // k < ml + pk or (bottom - top) // k < mt + pk:
+        return None
+    box = (left, top, right, bottom)
+    ra, rb = a.crop(box).convert("L"), b.crop(box).convert("L")
+    if k > 1:
+        ra, rb = ra.reduce(k), rb.reduce(k)
+    m = _giffy.match(ra.tobytes(), rb.tobytes(), ra.width, ra.height, ml, mt, pk,
+                     round(dx0 / k), round(dy0 / k), r, r)
+    if m[2] < NCC_MIN or m[4]:
+        return None
+    return m[0] * k, m[1] * k
+
+
 def refine(frames: list[Image.Image], al: Alignment) -> list[tuple[int, int]]:
-    """al's shifts as whole pixels at these frames' size, re-matched locally.
-    Only the region around the patch is looked at, so this costs little at full size."""
+    """al's shifts as whole pixels at these frames' size, re-matched locally with a
+    patch covering the same share of the frame as find()'s, coarse to fine. Where a
+    step doesn't match well, the answer so far stands."""
     n = len(frames)
     if al.status == "none":
         return [(0, 0)] * n
     w, h = frames[0].size
-    p = min(REFINE_CAP, max(2, round(PATCH * w)), w, h)
+    aw = min(ANALYSIS_W, w)
+    p = min(w, h, max(2, round(round(PATCH * ANALYSIS_W) * w / aw)))
     x = min(max(round(al.point[0] * w - p / 2), 0), w - p)
     y = min(max(round(al.point[1] * h - p / 2), 0), h - p)
-    r = math.ceil(max(w / ANALYSIS_W, 1.0)) + 1
+    k = max(1, math.ceil(p / REFINE_PATCH))
+    r = math.ceil(w / aw) + 1   # find()'s answer is within one analysis pixel
+    steps = [(k, math.ceil(r / k) + 1), (1, k + 1)] if k > 1 else [(1, r)]
     out = []
     for i in range(n):
-        dx0, dy0 = round(al.shifts[i][0] * w), round(al.shifts[i][1] * h)
-        if i == al.ref:
-            out.append((0, 0))
-            continue
-        # one region holding the patch and every window position, in both frames
-        l, t = max(0, min(x, x + dx0 - r)), max(0, min(y, y + dy0 - r))
-        rr, b = min(w, max(x + p, x + dx0 + r + p)), min(h, max(y + p, y + dy0 + r + p))
-        a, c = frames[al.ref].crop((l, t, rr, b)).convert("L"), frames[i].crop((l, t, rr, b)).convert("L")
-        m = _giffy.match(a.tobytes(), c.tobytes(), rr - l, b - t, x - l, y - t, p, dx0, dy0, r, r)
-        out.append((m[0], m[1]) if m[2] > -1 else (dx0, dy0))
+        d = (round(al.shifts[i][0] * w), round(al.shifts[i][1] * h))
+        if i != al.ref:
+            for kk, rr in steps:
+                m = _match_near(frames[al.ref], frames[i], x, y, p, d[0], d[1], rr, kk)
+                if m is None:
+                    break
+                d = m
+        out.append((0, 0) if i == al.ref else d)
     return out
 
 

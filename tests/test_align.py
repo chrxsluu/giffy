@@ -32,7 +32,8 @@ def match(ref, other, x, y, size, dx0=0, dy0=0, rx=40, ry=8):
 
 def test_match_finds_a_known_shift():
     ref = textured()
-    dx, dy, best, second = match(ref, shifted(ref, 17, -3), 100, 80, 32)
+    dx, dy, best, second, edge = match(ref, shifted(ref, 17, -3), 100, 80, 32)
+    assert not edge
     assert (dx, dy) == (17, -3)
     assert best > 0.99
 
@@ -40,7 +41,7 @@ def test_match_finds_a_known_shift():
 def test_match_ignores_brightness_and_contrast():
     ref = textured()
     other = Image.eval(shifted(ref, 9, 2), lambda v: int(v * 0.7 + 30))
-    dx, dy, best, _ = match(ref, other, 100, 80, 32)
+    dx, dy, best, _, _ = match(ref, other, 100, 80, 32)
     assert (dx, dy) == (9, 2)
     assert best > 0.98
 
@@ -48,16 +49,23 @@ def test_match_ignores_brightness_and_contrast():
 def test_match_second_peak_on_repeats():
     stripes = Image.new("L", (320, 240))
     stripes.putdata([255 if (x // 6) % 2 else 0 for y in range(240) for x in range(320)])
-    _, _, best, second = match(stripes, stripes, 100, 80, 32)
+    _, _, best, second, _ = match(stripes, stripes, 100, 80, 32)
     assert second > 0.9
     ref = textured()
-    _, _, best, second = match(ref, ref, 100, 80, 32)
+    _, _, best, second, _ = match(ref, ref, 100, 80, 32)
     assert second < best - 0.1
+
+
+def test_match_flags_a_best_spot_at_the_frame_edge():
+    ref = textured()
+    other = shifted(ref, -6, 0)          # the content moved left, off the frame
+    m = match(ref, other, 0, 80, 32, rx=10, ry=2)   # patch flush with the left edge
+    assert len(m) == 5 and m[4] is True
 
 
 def test_match_flat_patch_scores_zero():
     flat = Image.new("L", (320, 240), 90)
-    _, _, best, _ = match(flat, textured(), 100, 80, 32)
+    _, _, best, _, _ = match(flat, textured(), 100, 80, 32)
     assert best == 0.0
 
 
@@ -75,8 +83,8 @@ def test_match_validates():
     big = bytes(4100 * 4100)
     with pytest.raises(ValueError):   # rows past 4096 px could overflow the 32-bit row sums
         _giffy.match(big, big, 4100, 4100, 0, 0, 4097, 0, 0, 1, 1)
-    _, _, best, second = _giffy.match(b, b, 320, 240, 10, 10, 32, 1000, 0, 4, 4)
-    assert best == -1.0 and second == -1.0
+    _, _, best, second, edge = _giffy.match(b, b, 320, 240, 10, 10, 32, 1000, 0, 4, 4)
+    assert best == -1.0 and second == -1.0 and edge
 
 
 # ---------------------------------------------------------------- alignment decisions
@@ -324,7 +332,7 @@ def held_still(frames) -> bool:
     p = max(8, w // 10)
     x, y = (w - p) // 2, (h - p) // 2
     for f in frames[1:]:
-        dx, dy, best, _ = _giffy.match(ref.tobytes(), f.convert("L").tobytes(), w, h, x, y, p, 0, 0, 8, 4)
+        dx, dy, best, _, _ = _giffy.match(ref.tobytes(), f.convert("L").tobytes(), w, h, x, y, p, 0, 0, 8, 4)
         if abs(dx) > 1 or abs(dy) > 1 or best < 0.8:
             return False
     return True
@@ -415,3 +423,37 @@ def test_unaligned_shot_is_not_evened():
     shot = encode_shot(frames)
     assert shot.alignment.status == "none"
     assert shot.alignment.gains == ((1.0, 1.0, 1.0),) * 4
+
+
+# ---------------------------------------------------------------- final review fixes
+
+def test_moved_point_holds_at_full_size():
+    # flat frame, detail starting 180 px right of centre: find moves the point onto it
+    w, h = 2592, 1944
+    square = textured_rgb(420, 420, 31)
+    frames = []
+    for i in range(4):
+        f = Image.new("RGB", (w, h), (128, 128, 128))
+        f.paste(square, (w // 2 + 180 + 30 * (i - 1), h // 2 - 210))
+        frames.append(f)
+    al = find(frames)
+    assert al.status == "moved"
+    assert near(refine(frames, al), [(30 * (i - 1), 0) for i in range(4)])
+
+
+def test_tap_in_the_corner_is_right_or_unaligned():
+    frames = parallax(4, 20, 4)
+    al = find(frames, (1.0, 1.0))
+    assert al.status == "none" or near(refine(frames, al), [(4 * (i - 1), 0) for i in range(4)]), al
+
+
+def test_no_align_means_no_evening_unless_asked():
+    frames = [textured_rgb(640, 480, s) for s in (1, 20, 40, 60)]
+    assert encode(frames, align=None) == encode(frames, align=None, even=False)
+    assert encode(frames, align=None, even=True) != encode(frames, align=None, even=False)
+
+
+def test_align_point_as_a_list():
+    frames = parallax(4, 20, 4)
+    want = encode(frames, order=[1, 2, 3], align=(0.5625, 0.5, 3))
+    assert encode(frames, order=[1, 2, 3], align=[0.5625, 0.5, 3]) == want

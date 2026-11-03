@@ -650,7 +650,7 @@ static PyObject *py_match(PyObject *self, PyObject *args) {
     const int gw = (int)(2 * rx + 1), gh = (int)(2 * ry + 1);
     grid = malloc(sizeof *grid * (size_t)gw * (size_t)gh);
     if (!grid) { PyErr_NoMemory(); goto done; }
-    int bx = -1, by = -1;
+    int bx = -1, by = -1, edge = 0;
     double best = -1.0, second = -1.0;
     Py_BEGIN_ALLOW_THREADS
     match_grid(rb.buf, ob.buf, (int)w, (int)h, (int)x, (int)y, (int)size, (int)dx0, (int)dy0, (int)rx, (int)ry, grid);
@@ -660,6 +660,12 @@ static PyObject *py_match(PyObject *self, PyObject *args) {
             if (s > NO_SCORE && (bx < 0 || s > best)) { best = s; bx = gx; by = gy; }
         }
     if (bx >= 0) {
+        /* a best spot next to an off-frame offset may only be the frame's edge, not the match */
+        const int nb[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+        for (int k = 0; k < 4; k++) {
+            const int gx = bx + nb[k][0], gy = by + nb[k][1];
+            if (gx >= 0 && gy >= 0 && gx < gw && gy < gh && grid[(size_t)gy * gw + gx] <= NO_SCORE) edge = 1;
+        }
         const int rad = size / 4 > 2 ? (int)(size / 4) : 2;
         for (int gy = 0; gy < gh; gy++)
             for (int gx = 0; gx < gw; gx++) {
@@ -669,8 +675,8 @@ static PyObject *py_match(PyObject *self, PyObject *args) {
             }
     }
     Py_END_ALLOW_THREADS
-    if (bx < 0) res = Py_BuildValue("(nndd)", dx0, dy0, -1.0, -1.0);
-    else res = Py_BuildValue("(nndd)", dx0 - rx + bx, dy0 - ry + by, best, second);
+    if (bx < 0) res = Py_BuildValue("(nnddO)", dx0, dy0, -1.0, -1.0, Py_True);
+    else res = Py_BuildValue("(nnddO)", dx0 - rx + bx, dy0 - ry + by, best, second, edge ? Py_True : Py_False);
 done:
     free(grid);
     PyBuffer_Release(&rb); PyBuffer_Release(&ob);
@@ -688,9 +694,10 @@ static PyMethodDef methods[] = {
     {"remap", py_remap, METH_VARARGS,
      "remap(rgb, w, h, palette) -> index bytes, for a palette holding every colour (else nearest)."},
     {"match", py_match, METH_VARARGS,
-     "match(ref, other, w, h, x, y, size, dx0, dy0, rx, ry) -> (dx, dy, best, second).\n"
+     "match(ref, other, w, h, x, y, size, dx0, dy0, rx, ry) -> (dx, dy, best, second, edge).\n"
      "Where the size x size luma patch at (x, y) in ref sits in other, searching\n"
-     "dx0 +- rx, dy0 +- ry; scores are zero-mean NCC, second = best score away from the peak."},
+     "dx0 +- rx, dy0 +- ry; scores are zero-mean NCC, second = best score away from the peak,\n"
+     "edge = the best spot borders offsets where the patch would leave the frame."},
     {"lzw", py_lzw, METH_VARARGS,
      "lzw(indices, min_code_size) -> GIF image data (code size, sub-blocks, terminator)."},
     {NULL, NULL, 0, NULL},

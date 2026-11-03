@@ -98,14 +98,14 @@ def _fits(al: Alignment, n: int, aspect: float) -> bool:
 
 def encode(images: Sequence[Source], width: int | None = None, delay_ms: int = 100,
            order: Iterable[int] | None = None, colors: int = 256, dither: bool = True,
-           lossy: float = LOSSY, threads: int | None = None, align=CENTER, even: bool = True) -> bytes:
+           lossy: float = LOSSY, threads: int | None = None, align=CENTER, even: bool | None = None) -> bytes:
     """GIF bytes for `images`: encode_shot(...).gif."""
     return encode_shot(images, width, delay_ms, order, colors, dither, lossy, threads, align, even).gif
 
 
 def encode_shot(images: Sequence[Source], width: int | None = None, delay_ms: int = 100,
                 order: Iterable[int] | None = None, colors: int = 256, dither: bool = True,
-                lossy: float = LOSSY, threads: int | None = None, align=CENTER, even: bool = True) -> Shot:
+                lossy: float = LOSSY, threads: int | None = None, align=CENTER, even: bool | None = None) -> Shot:
     """The GIF for `images` (paths or PIL images), looping forever, and how it was aligned.
 
     width: None keeps the photos' size; else the finished GIF is this many px wide.
@@ -115,7 +115,9 @@ def encode_shot(images: Sequence[Source], width: int | None = None, delay_ms: in
     align: the point to hold still, (x, y) as fractions of the middle frame or
     (x, y, frame) for a point seen in another frame; an Alignment from an
     earlier call (e.g. the preview) to reuse; or None to leave frames as shot.
-    even: even out brightness and colour between the lenses.
+    even: even out brightness and colour between the lenses. None (default) = when
+    aligning; frames left as shot may not show the same view, so evening them is
+    only done when asked for with even=True.
     Alpha is dropped. All photos must come out the same size.
     """
     if not images:
@@ -130,6 +132,10 @@ def encode_shot(images: Sequence[Source], width: int | None = None, delay_ms: in
         raise ValueError(f"order {order} must pick from frames 0..{len(images) - 1}")
     used = sorted(set(order))
     threads = threads or min(4, os.cpu_count() or 1)
+    if even is None:
+        even = align is not None
+    if align is not None and not isinstance(align, Alignment):
+        align = tuple(align)
     if isinstance(align, tuple):
         if len(align) not in (2, 3):
             raise ValueError(f"align {align} must be (x, y) or (x, y, frame)")
@@ -223,7 +229,7 @@ def main(argv=None) -> None:
     ap.add_argument("--no-align", action="store_true", help="leave the frames as shot")
     ap.add_argument("--align-at", nargs="+", metavar="X Y [FRAME]",
                     help="point to hold still, as fractions (default: the centre); FRAME = the frame it's seen in")
-    ap.add_argument("--no-even", action="store_true", help="don't even out brightness and colour")
+    ap.add_argument("--no-even", action="store_true", help="don't even out brightness and colour (it's off with --no-align)")
     ap.add_argument("--threads", type=int)
     a = ap.parse_args(argv)
     order = range(len(a.images)) if a.forward else None
@@ -235,4 +241,5 @@ def main(argv=None) -> None:
             ap.error("--align-at takes X Y or X Y FRAME")
         align = (float(a.align_at[0]), float(a.align_at[1])) + ((int(a.align_at[2]),) if len(a.align_at) == 3 else ())
     print(make_gif(a.images, a.out, a.width, a.delay, order=order, colors=a.colors,
-                   dither=not a.no_dither, lossy=a.lossy, threads=a.threads, align=align, even=not a.no_even))
+                   dither=not a.no_dither, lossy=a.lossy, threads=a.threads, align=align,
+                   even=False if a.no_even else None))
