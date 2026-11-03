@@ -592,6 +592,88 @@ done:
     return out;
 }
 
+/* ---------------------------------------------------------------- matching */
+
+#define NO_SCORE (-2.0)   /* offset where the patch would leave the frame */
+
+/* Zero-mean normalised cross-correlation of the size x size patch at (x, y) in
+ * ref against each offset of the search window in other. Scores ignore
+ * brightness and contrast; a flat patch or window scores 0. */
+static void match_grid(const uint8_t *ref, const uint8_t *oth, int w, int h, int x, int y, int size,
+                       int dx0, int dy0, int rx, int ry, double *grid) {
+    const double n = (double)size * size;
+    int64_t sp = 0, spp = 0;
+    for (int j = 0; j < size; j++)
+        for (int i = 0; i < size; i++) {
+            int64_t p = ref[(size_t)(y + j) * w + x + i];
+            sp += p; spp += p * p;
+        }
+    const double pvar = (double)spp - (double)sp * sp / n;
+    for (int gy = 0; gy <= 2 * ry; gy++)
+        for (int gx = 0; gx <= 2 * rx; gx++) {
+            const int ox = x + dx0 - rx + gx, oy = y + dy0 - ry + gy;
+            double *g = &grid[(size_t)gy * (2 * rx + 1) + gx];
+            if (ox < 0 || oy < 0 || ox + size > w || oy + size > h) { *g = NO_SCORE; continue; }
+            int64_t sq = 0, sqq = 0, spq = 0;
+            for (int j = 0; j < size; j++) {
+                const uint8_t *pr = ref + (size_t)(y + j) * w + x, *qr = oth + (size_t)(oy + j) * w + ox;
+                for (int i = 0; i < size; i++) {
+                    const int64_t p = pr[i], q = qr[i];
+                    sq += q; sqq += q * q; spq += p * q;
+                }
+            }
+            const double qvar = (double)sqq - (double)sq * sq / n, cov = (double)spq - (double)sp * sq / n;
+            *g = (pvar <= 0 || qvar <= 0) ? 0.0 : cov / sqrt(pvar * qvar);
+        }
+}
+
+static PyObject *py_match(PyObject *self, PyObject *args) {
+    Py_buffer rb, ob;
+    Py_ssize_t w, h, x, y, size, dx0, dy0, rx, ry;
+    if (!PyArg_ParseTuple(args, "y*y*nnnnnnnnn", &rb, &ob, &w, &h, &x, &y, &size, &dx0, &dy0, &rx, &ry)) return NULL;
+    PyObject *res = NULL;
+    double *grid = NULL;
+    if (check_size(w, h) < 0) goto done;
+    if ((uint64_t)rb.len != (uint64_t)w * (uint64_t)h || (uint64_t)ob.len != (uint64_t)w * (uint64_t)h) {
+        PyErr_SetString(PyExc_ValueError, "luma buffers must be w*h bytes"); goto done;
+    }
+    if (size < 2 || x < 0 || y < 0 || x + size > w || y + size > h) {
+        PyErr_SetString(PyExc_ValueError, "the patch must lie inside the frame"); goto done;
+    }
+    if (rx < 0 || ry < 0 || rx > MAX_SIDE || ry > MAX_SIDE || dx0 < -MAX_SIDE || dx0 > MAX_SIDE ||
+        dy0 < -MAX_SIDE || dy0 > MAX_SIDE) {
+        PyErr_SetString(PyExc_ValueError, "search window out of range"); goto done;
+    }
+    const int gw = (int)(2 * rx + 1), gh = (int)(2 * ry + 1);
+    grid = malloc(sizeof *grid * (size_t)gw * (size_t)gh);
+    if (!grid) { PyErr_NoMemory(); goto done; }
+    int bx = -1, by = -1;
+    double best = -1.0, second = -1.0;
+    Py_BEGIN_ALLOW_THREADS
+    match_grid(rb.buf, ob.buf, (int)w, (int)h, (int)x, (int)y, (int)size, (int)dx0, (int)dy0, (int)rx, (int)ry, grid);
+    for (int gy = 0; gy < gh; gy++)   /* first maximum = smallest dy, then smallest dx */
+        for (int gx = 0; gx < gw; gx++) {
+            const double s = grid[(size_t)gy * gw + gx];
+            if (s > NO_SCORE && (bx < 0 || s > best)) { best = s; bx = gx; by = gy; }
+        }
+    if (bx >= 0) {
+        const int rad = size / 4 > 2 ? (int)(size / 4) : 2;
+        for (int gy = 0; gy < gh; gy++)
+            for (int gx = 0; gx < gw; gx++) {
+                const double s = grid[(size_t)gy * gw + gx];
+                const int far = abs(gx - bx) > rad || abs(gy - by) > rad;
+                if (far && s > NO_SCORE && s > second) second = s;
+            }
+    }
+    Py_END_ALLOW_THREADS
+    if (bx < 0) res = Py_BuildValue("(nndd)", dx0, dy0, -1.0, -1.0);
+    else res = Py_BuildValue("(nndd)", dx0 - rx + bx, dy0 - ry + by, best, second);
+done:
+    free(grid);
+    PyBuffer_Release(&rb); PyBuffer_Release(&ob);
+    return res;
+}
+
 /* ------------------------------------------------------------------- module */
 
 static PyMethodDef methods[] = {
@@ -602,6 +684,10 @@ static PyMethodDef methods[] = {
      "Dithers (error x strength/16) and LZW-encodes in one pass; lossy > 0 trades error for size."},
     {"remap", py_remap, METH_VARARGS,
      "remap(rgb, w, h, palette) -> index bytes, for a palette holding every colour (else nearest)."},
+    {"match", py_match, METH_VARARGS,
+     "match(ref, other, w, h, x, y, size, dx0, dy0, rx, ry) -> (dx, dy, best, second).\n"
+     "Where the size x size luma patch at (x, y) in ref sits in other, searching\n"
+     "dx0 +- rx, dy0 +- ry; scores are zero-mean NCC, second = best score away from the peak."},
     {"lzw", py_lzw, METH_VARARGS,
      "lzw(indices, min_code_size) -> GIF image data (code size, sub-blocks, terminator)."},
     {NULL, NULL, 0, NULL},
