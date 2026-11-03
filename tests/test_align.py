@@ -1,7 +1,7 @@
 import random
 
 import pytest
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageStat
 
 from giffy import _giffy
 
@@ -214,3 +214,58 @@ def test_alignment_records_what_happened():
     assert al.aspect == pytest.approx(640 / 480)
     assert 0.6 <= al.confidence <= 1.0 and al.gains == ()
     assert al.crop != (0.0, 0.0, 1.0, 1.0)
+
+
+# ---------------------------------------------------------------- even lighting
+
+from giffy import even  # noqa: E402
+from giffy.even import GAIN_MAX, GAIN_MIN  # noqa: E402
+
+
+def scaled(im: Image.Image, k: tuple[float, float, float]) -> Image.Image:
+    return Image.merge("RGB", [b.point(lambda v, f=f: min(255, round(v * f))) for b, f in zip(im.split(), k)])
+
+
+def channel_means(im: Image.Image, box=None):
+    return ImageStat.Stat(im if box is None else im.crop(box)).mean
+
+
+def spread(frames, box=None) -> float:
+    """Largest relative difference between frames' channel means."""
+    ms = [channel_means(f, box) for f in frames]
+    return max((max(m[c] for m in ms) - min(m[c] for m in ms)) / (sum(m[c] for m in ms) / len(ms)) for c in range(3))
+
+
+def test_even_removes_lens_differences():
+    base = textured_rgb(320, 240, 5)
+    frames = [base, scaled(base, (1.08, 0.95, 1.0)), base, scaled(base, (0.93, 1.04, 1.06))]
+    assert spread(frames) > 0.05
+    g = even.gains(frames)
+    assert spread([even.apply(f, gi) for f, gi in zip(frames, g)]) < 0.01
+
+
+def test_even_leaves_matched_frames_alone():
+    base = textured_rgb(320, 240, 5)
+    assert all(abs(v - 1.0) < 1e-6 for gi in even.gains([base] * 4) for v in gi)
+    assert even.apply(base, (1.0, 1.0, 1.0)) is base
+
+
+def test_even_ignores_content_differences():
+    g = even.gains(parallax(4, 20, 4))
+    assert all(abs(v - 1.0) <= 0.01 for gi in g for v in gi), g
+
+
+def test_even_is_capped():
+    base = textured_rgb(320, 240, 5)
+    g = even.gains([base, scaled(base, (0.5, 0.5, 0.5)), base, base])
+    assert all(v <= GAIN_MAX for v in g[1]) and all(GAIN_MIN <= v for gi in g for v in gi)
+
+
+def test_even_skips_clipped_pixels():
+    base = textured_rgb(320, 240, 5)
+    ImageDraw.Draw(base).rectangle([0, 0, 223, 239], fill=(255, 255, 255))   # 70% pure white
+    frames = [base, scaled(base, (1.05, 1.05, 1.05)), base, base]
+    mid = (224, 0, 320, 240)
+    assert spread(frames, mid) > 0.03
+    g = even.gains(frames)
+    assert spread([even.apply(f, gi) for f, gi in zip(frames, g)], mid) < 0.01
