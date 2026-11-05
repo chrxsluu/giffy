@@ -452,3 +452,45 @@ def test_off_is_byte_identical_to_before():
     b = encode(seeded_scene(400, 300, n=3), width=200, lossy=0, **OFF)
     assert hashlib.sha256(a).hexdigest() == "7114fde56317d43b4ce656a9110ac5076c789ca31986bcb52b87bbca34cbf6aa"
     assert hashlib.sha256(b).hexdigest() == "f1253de05298e1115fb40ec00ab043c1c1835d6086ad0bd25c4d2558a0e7e085"
+
+
+# ---------------------------------------------------------------- hardening (2026-11-04 review)
+
+def forged_jpeg(tmp_path, w, h):
+    """A tiny real JPEG whose header claims w x h (a decompression bomb)."""
+    p = tmp_path / f"forged-{w}x{h}.jpg"
+    Image.new("RGB", (16, 16), (90, 120, 200)).save(p, quality=80)
+    data = bytearray(p.read_bytes())
+    sof = data.index(b"\xff\xc0")
+    data[sof + 5:sof + 9] = struct.pack(">HH", h, w)
+    p.write_bytes(bytes(data))
+    with Image.open(p) as im:
+        assert im.size == (w, h)
+    return p
+
+
+@pytest.mark.parametrize("mode", ["loop", "shimmy"])
+def test_rejects_photos_over_the_pixel_limit_before_decoding(tmp_path, mode):
+    bomb = forged_jpeg(tmp_path, 13000, 13000)
+    with pytest.raises(ValueError, match="pixel"):
+        encode([bomb, bomb], mode=mode)
+
+
+def test_rejects_empty_images():
+    with pytest.raises(ValueError):
+        encode([Image.new("RGB", (0, 0))] * 2, mode="loop")
+
+
+@pytest.mark.parametrize("kw", [dict(width=65536), dict(lossy=float("nan")), dict(lossy="4"), dict(lossy=-1)])
+def test_bad_arguments_fail_before_any_work(kw):
+    with pytest.raises(ValueError):
+        encode([Image.new("RGB", (8, 8))] * 2, mode="loop", **kw)
+
+
+def test_encode_ignores_stale_lut_slots():
+    rnd = random.Random(3)
+    rgb = bytes(rnd.randrange(256) for _ in range(3 * 32 * 32))
+    pal = distinct_palette(4)
+    fresh = _giffy.encode(rgb, 32, 32, pal, bytearray(b"\xff\xff") * _giffy.LUT_SIZE, 2, 4.0, 14)
+    stale = bytearray(b"\x00\x01") * _giffy.LUT_SIZE   # every slot says colour 256, from a bigger palette
+    assert _giffy.encode(rgb, 32, 32, pal, stale, 2, 4.0, 14) == fresh

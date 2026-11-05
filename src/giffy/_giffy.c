@@ -66,7 +66,7 @@ static int nearest(const Pal *p, int r, int g, int b) {
 static inline int lut_get(uint16_t *lut, const Pal *p, int r, int g, int b) {
     int key = ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2);
     uint16_t v = __atomic_load_n(&lut[key], __ATOMIC_RELAXED);
-    if (v == 0xFFFF) {
+    if (v >= (unsigned)p->n) {   /* empty (0xFFFF), or a slot left by another palette */
         v = (uint16_t)nearest(p, (r & ~3) | 2, (g & ~3) | 2, (b & ~3) | 2);
         __atomic_store_n(&lut[key], v, __ATOMIC_RELAXED);
     }
@@ -385,7 +385,7 @@ static inline void emit(BitW *b, uint32_t code, int size) {   /* GIF packs codes
 typedef struct {
     BitW b;
     uint32_t clear, eoi, nxt, gen, w;   /* w: code of the string so far */
-    int size, min;
+    int size, min, hash;                /* hash: 0 = child lists only (lossy path) */
     uint32_t *keys;                     /* (gen << 20 | w << 8 | c), other generations = empty */
     uint16_t *codes;
     uint16_t *first, *next;             /* optional child lists: first[w], next[child] */
@@ -398,7 +398,8 @@ static void lzw_start(Lzw *z, int min, uint8_t *out, LzwMem *m, int children) {
     z->min = min; z->clear = 1u << min; z->eoi = z->clear + 1; z->nxt = z->eoi + 1; z->gen = 1;
     z->size = min + 1; z->keys = m->keys; z->codes = m->codes;
     z->first = children ? m->first : NULL; z->next = m->next; z->sym = m->sym;
-    memset(m->keys, 0, sizeof m->keys);
+    z->hash = !children;
+    if (z->hash) memset(m->keys, 0, sizeof m->keys);
     if (children) memset(m->first, 0xFF, sizeof m->first);
     z->b = (BitW){out, 2, 1, 0, 0, 0};
     out[0] = (uint8_t)min;
@@ -421,15 +422,14 @@ static inline int lzw_child(const Lzw *z, uint32_t c, uint32_t *slot) {
 static inline void lzw_add(Lzw *z, uint32_t c, uint32_t slot) {
     emit(&z->b, z->w, z->size);
     const uint32_t code = z->nxt++;
-    z->keys[slot] = (z->gen << 20) | (z->w << 8) | c;
-    z->codes[slot] = (uint16_t)code;
+    if (z->hash) { z->keys[slot] = (z->gen << 20) | (z->w << 8) | c; z->codes[slot] = (uint16_t)code; }
     if (z->first) { z->sym[code] = (uint8_t)c; z->next[code] = z->first[z->w]; z->first[z->w] = (uint16_t)code; }
     if (z->nxt > (1u << z->size) && z->size < 12) z->size++;
     if (z->nxt == 4096) {                            /* table full: start over */
         emit(&z->b, z->clear, z->size);
         z->size = z->min + 1;
         z->nxt = z->eoi + 1;
-        if (++z->gen == 4096) { memset(z->keys, 0, sizeof *z->keys * HSIZE); z->gen = 1; }
+        if (++z->gen == 4096) { if (z->hash) memset(z->keys, 0, sizeof *z->keys * HSIZE); z->gen = 1; }
         if (z->first) memset(z->first, 0xFF, sizeof *z->first * 4096);
     }
     z->w = c;
@@ -533,16 +533,23 @@ static int encode_dither(const uint8_t *rgb, int w, int h, const Pal *p, uint16_
             if (x == 0 && y == 0) {
                 z.w = (uint32_t)k;
             } else {
-                uint32_t slot;
-                int code = lzw_child(&z, (uint32_t)k, &slot);
-                if (code < 0 && z.first) {
-                    const float lim = sqrtf((float)dist2(p, k, v)) + lossy;
-                    int32_t bd = (int32_t)(lim * lim) + 1;
+                uint32_t slot = 0;
+                int code;
+                if (z.first) {
+                    /* one walk over w's children: the exact one ends it; otherwise the
+                     * nearest within `lossy` (first of equals, as in the hash version) */
+                    code = -1;
+                    int32_t bd = -1;
                     for (uint32_t ch = z.first[z.w]; ch != NONE; ch = z.next[ch]) {
-                        const int32_t dc = dist2(p, z.sym[ch], v);
+                        const int s = z.sym[ch];
+                        if (s == k) { code = (int)ch; break; }
+                        if (bd < 0) { const float lim = sqrtf((float)dist2(p, k, v)) + lossy; bd = (int32_t)(lim * lim) + 1; }
+                        const int32_t dc = dist2(p, s, v);
                         if (dc < bd) { bd = dc; code = (int)ch; }
                     }
                     if (code >= 0) k = z.sym[code];
+                } else {
+                    code = lzw_child(&z, (uint32_t)k, &slot);
                 }
                 if (code >= 0) z.w = (uint32_t)code;
                 else lzw_add(&z, (uint32_t)k, slot);
@@ -647,6 +654,8 @@ static PyObject *py_match(PyObject *self, PyObject *args) {
         dy0 < -MAX_SIDE || dy0 > MAX_SIDE) {
         PyErr_SetString(PyExc_ValueError, "search window out of range"); goto done;
     }
+    if (rx > w) rx = w;   /* a shift past the frame never scores, so a wider window is pure waste */
+    if (ry > h) ry = h;
     const int gw = (int)(2 * rx + 1), gh = (int)(2 * ry + 1);
     grid = malloc(sizeof *grid * (size_t)gw * (size_t)gh);
     if (!grid) { PyErr_NoMemory(); goto done; }

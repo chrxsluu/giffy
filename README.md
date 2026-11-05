@@ -56,6 +56,7 @@ What it handles for you:
 - **Alpha** is dropped.
 - **Exact colours:** shots with 256 colours or fewer are stored exactly.
 - **Mismatched sizes:** if the photos come out different sizes, it raises `ValueError` instead of guessing.
+- **Oversized or forged photos:** a photo over `giffy.MAX_PIXELS` (50 MP) is rejected from its header, before anything is decoded, so a bad file can't use up memory.
 - **Determinism:** the same photos always give the same bytes, whatever the thread count.
 
 ### Alignment

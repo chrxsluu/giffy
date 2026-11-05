@@ -457,3 +457,11 @@ def test_align_point_as_a_list():
     frames = parallax(4, 20, 4)
     want = encode(frames, order=[1, 2, 3], align=(0.5625, 0.5, 3))
     assert encode(frames, order=[1, 2, 3], align=[0.5625, 0.5, 3]) == want
+
+
+def test_match_clamps_a_huge_search_window():
+    import time
+    b = bytes(range(256)) * 4   # 32 x 32
+    t = time.perf_counter()
+    _giffy.match(b, b, 32, 32, 8, 8, 8, 0, 0, 65535, 65535)
+    assert time.perf_counter() - t < 1.0

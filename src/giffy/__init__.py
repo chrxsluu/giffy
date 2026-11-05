@@ -41,6 +41,7 @@ LOSSY = 4      # max extra RGB distance a pixel may take to lengthen an LZW matc
 STRENGTH = 14  # Floyd-Steinberg error kept, in 16ths: a touch under full cleans flat areas
 CROP_ROOM = 0.85  # aligned shots decode at width / this, so a crop up to 15% needs no upscaling
 MODES = ("normal", "loop", "shimmy")
+MAX_PIXELS = 50_000_000  # per photo, checked from the header before decoding (48 MP phones fit; lenses are 5 MP)
 BY_MODE = object()  # align default: the centre in shimmy mode, frames as shot otherwise
 
 
@@ -55,11 +56,19 @@ def wiggle_order(n: int) -> list[int]:
     return list(range(n)) + list(range(n - 2, 0, -1))
 
 
+def _check_pixels(im: Image.Image) -> None:
+    """Refuse empty photos and decompression bombs before anything is decoded."""
+    n = im.width * im.height
+    if not 0 < n <= MAX_PIXELS:
+        raise ValueError(f"photo is {im.width}x{im.height} = {n} pixels; allowed 1..{MAX_PIXELS}")
+
+
 def _load(src: Source, width: int | None) -> tuple[tuple[int, int], bytes]:
     """Upright RGB pixels of one photo, `width` px wide (None = as shot)."""
     own = not isinstance(src, Image.Image)
     f = im = Image.open(src) if own else src
     try:
+        _check_pixels(im)
         orient = im.getexif().get(0x0112, 1)
         w, h = im.size[::-1] if orient in _SIDEWAYS else im.size
         if width and width != w:
@@ -85,6 +94,7 @@ def _upright(src: Source, width: int | None) -> Image.Image:
     own = not isinstance(src, Image.Image)
     f = im = Image.open(src) if own else src
     try:
+        _check_pixels(im)
         orient = im.getexif().get(0x0112, 1)
         w, h = im.size[::-1] if orient in _SIDEWAYS else im.size
         if own and width and width < w:
@@ -134,8 +144,10 @@ def encode_shot(images: Sequence[Source], width: int | None = None, delay_ms: in
     """
     if not images:
         raise ValueError("no images")
-    if width is not None and width < 1:
-        raise ValueError(f"width must be >= 1, got {width}")
+    if width is not None and not 1 <= width <= 0xFFFF:
+        raise ValueError(f"width must be 1..65535, got {width}")
+    if isinstance(lossy, bool) or not isinstance(lossy, (int, float)) or not math.isfinite(lossy) or lossy < 0:
+        raise ValueError(f"lossy must be a finite number >= 0, got {lossy!r}")
     cs = round(delay_ms / 10)  # GIF delays are in 1/100 s
     if not 0 <= cs <= 0xFFFF:
         raise ValueError(f"delay {delay_ms} ms is outside 0..655350")
