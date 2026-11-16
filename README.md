@@ -19,8 +19,10 @@ Options you pass yourself win over the mode's choices: `order=` sets the playbac
 ## Install
 
 ```bash
-uv add git+https://github.com/chrxsluu/giffy     # or: pip install git+https://github.com/chrxsluu/giffy
+uv add "giffy @ git+https://github.com/chrxsluu/giffy@v0.1.1"     # or: pip install "giffy @ git+https://github.com/chrxsluu/giffy@v0.1.1"
 ```
+
+Pin a release tag, as above. Every release gets a new MAJOR.MINOR.PATCH version and a `vX.Y.Z` tag (see [CHANGELOG.md](CHANGELOG.md) for what each number means), so moving the pin to a newer tag is enough for `pip install` to pick it up. Pinning a bare commit doesn't work that way: pip keeps whatever giffy it already has with the same version number.
 
 giffy compiles one C file on install, so the machine needs a C compiler and Python headers. On Raspberry Pi OS:
 
@@ -144,7 +146,13 @@ src/giffy/_giffy.c      palette, dither + lossy LZW, plain LZW, patch matching
 tests/                  pytest suite and the reference decoder
 bench/                  benchmarks (bring your own photo sets)
 docs/                   design, plans and benchmark reports
+tools/release.sh        cut a release: bump the version, test, commit, tag, push
+CHANGELOG.md            what changed in each version
 ```
+
+## Releasing
+
+Add a `## vX.Y.Z (date)` entry to `CHANGELOG.md`, then run `tools/release.sh X.Y.Z` on an up-to-date `main` (`--dry-run` bumps and tests without committing). It refuses a version that isn't newer, a missing changelog entry or uncommitted changes, then bumps `pyproject.toml`, runs the tests, commits, tags `vX.Y.Z` and pushes.
 
 ## License
 
