@@ -22,7 +22,7 @@ Options you pass yourself win over the mode's choices: `order=` sets the playbac
 uv add git+https://github.com/chrxsluu/giffy     # or: pip install git+https://github.com/chrxsluu/giffy
 ```
 
-The repo is private, so the machine needs GitHub access (a `gh auth login` or an SSH key). giffy compiles one C file on install, so it also needs a C compiler and Python headers. On Raspberry Pi OS:
+giffy compiles one C file on install, so the machine needs a C compiler and Python headers. On Raspberry Pi OS:
 
 ```bash
 sudo apt install build-essential python3-dev
